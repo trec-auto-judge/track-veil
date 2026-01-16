@@ -31,6 +31,7 @@ class RepairRule:
     action: RepairAction
     params: Dict[str, Any]    # Action-specific parameters
     pattern_hash: str         # Hash of (field_path, original_type, sample_structure)
+    team_id: Optional[str] = None  # If set, rule only applies to this team
 
     def apply(self, value: Any) -> Tuple[Any, bool]:
         """Apply repair rule to value. Returns (repaired_value, should_skip_record)."""
@@ -101,31 +102,54 @@ class RepairStore:
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS repair_rules (
-                pattern_hash TEXT PRIMARY KEY,
+                pattern_hash TEXT NOT NULL,
                 field_path TEXT NOT NULL,
                 original_type TEXT NOT NULL,
                 expected_type TEXT NOT NULL,
                 action TEXT NOT NULL,
                 params TEXT NOT NULL,
                 sample_value TEXT,
-                created_at TEXT NOT NULL
+                team_id TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (pattern_hash, team_id)
             )
             """
         )
         self._conn.commit()
 
-    def get_rule(self, field_path: str, value: Any) -> Optional[RepairRule]:
-        """Look up a repair rule for this field and value pattern."""
+    def get_rule(
+        self, field_path: str, value: Any, team_id: Optional[str] = None
+    ) -> Optional[RepairRule]:
+        """Look up a repair rule for this field and value pattern.
+
+        Checks team-specific rules first, then falls back to global rules.
+        """
         pattern_hash = compute_pattern_hash(field_path, value)
         cur = self._conn.cursor()
+
+        # First check for team-specific rule
+        if team_id:
+            cur.execute(
+                "SELECT * FROM repair_rules WHERE pattern_hash = ? AND team_id = ?",
+                (pattern_hash, team_id),
+            )
+            row = cur.fetchone()
+            if row:
+                return self._row_to_rule(row)
+
+        # Fall back to global rule (team_id IS NULL)
         cur.execute(
-            "SELECT * FROM repair_rules WHERE pattern_hash = ?",
+            "SELECT * FROM repair_rules WHERE pattern_hash = ? AND team_id IS NULL",
             (pattern_hash,),
         )
         row = cur.fetchone()
         if not row:
             return None
 
+        return self._row_to_rule(row)
+
+    def _row_to_rule(self, row: sqlite3.Row) -> RepairRule:
+        """Convert a database row to a RepairRule."""
         return RepairRule(
             field_path=row["field_path"],
             original_type=row["original_type"],
@@ -133,6 +157,7 @@ class RepairStore:
             action=RepairAction(row["action"]),
             params=json.loads(row["params"]),
             pattern_hash=row["pattern_hash"],
+            team_id=row["team_id"],
         )
 
     def save_rule(self, rule: RepairRule, sample_value: Any = None):
@@ -141,8 +166,8 @@ class RepairStore:
         cur.execute(
             """
             INSERT OR REPLACE INTO repair_rules
-            (pattern_hash, field_path, original_type, expected_type, action, params, sample_value, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (pattern_hash, field_path, original_type, expected_type, action, params, sample_value, team_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 rule.pattern_hash,
@@ -152,6 +177,7 @@ class RepairStore:
                 rule.action.value,
                 json.dumps(rule.params),
                 json.dumps(sample_value)[:1000] if sample_value else None,
+                rule.team_id,
                 datetime.now().isoformat(),
             ),
         )
@@ -161,17 +187,7 @@ class RepairStore:
         """Return all stored repair rules."""
         cur = self._conn.cursor()
         cur.execute("SELECT * FROM repair_rules")
-        return [
-            RepairRule(
-                field_path=row["field_path"],
-                original_type=row["original_type"],
-                expected_type=row["expected_type"],
-                action=RepairAction(row["action"]),
-                params=json.loads(row["params"]),
-                pattern_hash=row["pattern_hash"],
-            )
-            for row in cur.fetchall()
-        ]
+        return [self._row_to_rule(row) for row in cur.fetchall()]
 
     def close(self):
         self._conn.close()

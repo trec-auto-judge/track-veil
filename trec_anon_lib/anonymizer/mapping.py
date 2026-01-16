@@ -7,12 +7,22 @@ Stores:
 - Metadata (seed, creation time)
 """
 
+import hashlib
 import sqlite3
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from .pseudonyms import PseudonymPool
+
+
+def compute_report_fingerprint(topic_id: str, report_text: str) -> str:
+    """Compute SHA256 fingerprint from topic_id and report text.
+
+    Uses null separator to prevent collisions from concatenation.
+    """
+    content = f"{topic_id}\0{report_text}"
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
 class MappingStore:
@@ -77,6 +87,16 @@ class MappingStore:
             CREATE TABLE IF NOT EXISTS run_mappings (
                 original TEXT PRIMARY KEY,
                 anonymized TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS report_fingerprints (
+                fingerprint TEXT PRIMARY KEY,
+                original_team TEXT NOT NULL,
+                original_run TEXT NOT NULL,
+                topic_id TEXT NOT NULL,
+                anon_team TEXT NOT NULL,
+                anon_run TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
             """
@@ -183,12 +203,71 @@ class MappingStore:
         team_count = cur.fetchone()["count"]
         cur.execute("SELECT COUNT(*) as count FROM run_mappings")
         run_count = cur.fetchone()["count"]
+        cur.execute("SELECT COUNT(*) as count FROM report_fingerprints")
+        fingerprint_count = cur.fetchone()["count"]
         return {
             "teams": team_count,
             "runs": run_count,
+            "fingerprints": fingerprint_count,
             "teams_remaining": self._pool.teams_remaining,
             "runs_remaining": self._pool.runs_remaining,
         }
+
+    def store_fingerprint(
+        self,
+        fingerprint: str,
+        original_team: str,
+        original_run: str,
+        topic_id: str,
+        anon_team: str,
+        anon_run: str,
+    ) -> None:
+        """Store a report fingerprint with its mapping.
+
+        Uses INSERT OR IGNORE to handle duplicate fingerprints (same report
+        appearing multiple times).
+        """
+        cur = self._conn.cursor()
+        cur.execute(
+            """INSERT OR IGNORE INTO report_fingerprints
+               (fingerprint, original_team, original_run, topic_id,
+                anon_team, anon_run, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                fingerprint,
+                original_team,
+                original_run,
+                topic_id,
+                anon_team,
+                anon_run,
+                datetime.now().isoformat(),
+            ),
+        )
+        self._conn.commit()
+
+    def lookup_fingerprint(self, fingerprint: str) -> Optional[Dict[str, Any]]:
+        """Look up original identifiers by fingerprint.
+
+        Returns dict with keys: original_team, original_run, topic_id,
+                               anon_team, anon_run
+        Returns None if not found.
+        """
+        cur = self._conn.cursor()
+        cur.execute(
+            """SELECT original_team, original_run, topic_id, anon_team, anon_run
+               FROM report_fingerprints WHERE fingerprint = ?""",
+            (fingerprint,),
+        )
+        row = cur.fetchone()
+        if row:
+            return {
+                "original_team": row["original_team"],
+                "original_run": row["original_run"],
+                "topic_id": row["topic_id"],
+                "anon_team": row["anon_team"],
+                "anon_run": row["anon_run"],
+            }
+        return None
 
     @property
     def seed(self) -> int:

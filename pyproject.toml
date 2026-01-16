@@ -47,7 +47,6 @@ path = "trec_anon_lib/__init__.py"
 packages = ["trec_anon_lib"]
 
 [tool.pytest.ini_options]
-asyncio_mode = "auto"
 testpaths = ["tests"]
 
 [tool.ruff]

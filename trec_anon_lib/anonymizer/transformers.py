@@ -13,9 +13,10 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
-from .mapping import MappingStore
+from .mapping import MappingStore, compute_report_fingerprint
 from .repairs import RepairRule, RepairStore, suggest_repair_options
 from .errors import ErrorCollector, IssueType, EmailAction
+from ..report import Report
 
 # Type alias for email handler callback
 # Signature: (task: str, field_path: str, email: str, file_path: Path) -> EmailAction
@@ -48,7 +49,7 @@ class TsvFormatHint:
 
 
 def detect_tsv_format(lines: List[str]) -> TsvFormatHint:
-    """Detect TSV format based on column count and content.
+    """Detect TSV format based on column count, headers, and content.
 
     Returns a hint - user should confirm.
     """
@@ -65,6 +66,66 @@ def detect_tsv_format(lines: List[str]) -> TsvFormatHint:
 
     if not sample_rows:
         return TsvFormatHint(TsvFormat.UNKNOWN, "low", "No data rows", [])
+
+    # Check if first row looks like a header
+    # Known column names (case-insensitive)
+    RUN_ID_NAMES = {"run_id", "runtag", "run", "runid", "system"}
+    TOPIC_ID_NAMES = {"topic_id", "request_id", "query_id", "narrative_id",
+                      "topicid", "queryid"}  # Removed "topic", "qid", "query" - too common as values
+    METRIC_NAMES = {"metric", "measure", "eval_metric"}
+    VALUE_NAMES = {"value", "score", "result"}
+    ALL_HEADER_NAMES = RUN_ID_NAMES | TOPIC_ID_NAMES | METRIC_NAMES | VALUE_NAMES
+
+    first_row_lower = [col.lower() for col in sample_rows[0]]
+
+    # Only treat first row as header if it clearly looks like one:
+    # - Contains known header column names
+    # - Does NOT contain obvious numeric values (floats are clearly data)
+    def is_numeric(val: str) -> bool:
+        try:
+            float(val)
+            return True
+        except ValueError:
+            return False
+
+    # If any column is numeric, this is data, not a header
+    has_numeric = any(is_numeric(col) for col in sample_rows[0])
+
+    # Check if first row contains known header names
+    has_run_col = any(col in RUN_ID_NAMES for col in first_row_lower)
+    has_topic_col = any(col in TOPIC_ID_NAMES for col in first_row_lower)
+    has_metric_col = any(col in METRIC_NAMES for col in first_row_lower)
+
+    # Only treat as header if we have header-like names AND no numeric values
+    if not has_numeric and (has_run_col or (has_topic_col and has_metric_col)):
+        # This looks like a header row - find run_id column indices
+        run_id_cols = [i for i, col in enumerate(first_row_lower) if col in RUN_ID_NAMES]
+
+        if run_id_cols:
+            # Determine format based on columns present
+            header_desc = ", ".join(sample_rows[0])
+            if has_metric_col:
+                return TsvFormatHint(
+                    TsvFormat.IR_MEASURES,
+                    "high",
+                    f"Header detected: {header_desc}",
+                    run_id_cols,
+                )
+            else:
+                return TsvFormatHint(
+                    TsvFormat.RANKING,
+                    "high",
+                    f"Header detected: {header_desc}",
+                    run_id_cols,
+                )
+        elif has_topic_col and has_metric_col:
+            # Has topic and metric but no run_id - trec_eval style
+            return TsvFormatHint(
+                TsvFormat.TREC_EVAL,
+                "high",
+                f"Header detected (no run_id): {', '.join(sample_rows[0])}",
+                [],
+            )
 
     col_counts = [len(row) for row in sample_rows]
     typical_cols = max(set(col_counts), key=col_counts.count)
@@ -160,40 +221,6 @@ def detect_tsv_format(lines: List[str]) -> TsvFormatHint:
     )
 
 
-def anonymize_run_id_in_string(
-    value: str,
-    mapping: MappingStore,
-) -> str:
-    """Replace team-run patterns in a string.
-
-    Handles patterns like "team1-run1" -> "Fez-07"
-    """
-    # Get all known mappings
-    team_map = mapping.get_all_team_mappings()
-    run_map = mapping.get_all_run_mappings()
-
-    result = value
-
-    # Replace team-run combinations
-    for orig_team, anon_team in team_map.items():
-        for orig_run, anon_run in run_map.items():
-            # Pattern: team-run (with various separators)
-            for sep in ["-", "_", "."]:
-                old = f"{orig_team}{sep}{orig_run}"
-                new = f"{anon_team}{sep}{anon_run}"
-                result = result.replace(old, new)
-
-    # Also replace standalone occurrences
-    for orig_team, anon_team in team_map.items():
-        result = result.replace(orig_team, anon_team)
-    for orig_run, anon_run in run_map.items():
-        # Be careful with short run names - only replace if looks like identifier
-        if len(orig_run) > 2:  # Skip very short strings
-            result = result.replace(orig_run, anon_run)
-
-    return result
-
-
 class ReportTransformer:
     """Transform Report JSONL files (runs/)."""
 
@@ -235,6 +262,7 @@ class ReportTransformer:
         expected_type: type,
         file_path: Path,
         line_num: int,
+        team_id: Optional[str] = None,
     ) -> Tuple[Any, bool]:
         """Check field type and repair if needed.
 
@@ -255,8 +283,8 @@ class ReportTransformer:
         if isinstance(value, expected_type):
             return value, False
 
-        # Type mismatch - try to repair
-        rule = self.repairs.get_rule(field_path, value)
+        # Type mismatch - try to repair (check team-specific rules first)
+        rule = self.repairs.get_rule(field_path, value, team_id=team_id)
         if rule:
             repaired, skip = rule.apply(value)
             if not skip:
@@ -269,14 +297,19 @@ class ReportTransformer:
             print(f"  Field: {field_path}")
             print(f"  Expected: {expected_type.__name__}")
             print(f"  Got: {type(value).__name__} = {json.dumps(value)[:100]}")
+            if team_id:
+                print(f"  Team: {team_id}")
 
             options = suggest_repair_options(field_path, value, expected_type.__name__)
             choice = self.ask_fn("How to handle?", options)
             desc, rule = options[choice]
 
             # Ask if should remember
-            remember = input("Remember this fix for similar patterns? [Y/n]: ").strip().lower()
-            if remember != "n":
+            remember = input("Remember this fix? [Y]es for all, [t]his team only, [n]o: ").strip().lower()
+            if remember == "t" and team_id:
+                rule.team_id = team_id
+                self.repairs.save_rule(rule, sample_value=value)
+            elif remember != "n":
                 self.repairs.save_rule(rule, sample_value=value)
 
             repaired, skip = rule.apply(value)
@@ -300,8 +333,14 @@ class ReportTransformer:
         line: str,
         file_path: Path,
         line_num: int,
-    ) -> Optional[str]:
-        """Transform a single JSONL line. Returns None if record should be skipped."""
+    ) -> Tuple[Optional[str], Optional[Dict[str, str]]]:
+        """Transform a single JSONL line.
+
+        Returns (transformed_json, fingerprint_info) where fingerprint_info
+        is a dict with keys: fingerprint, original_team, original_run,
+                             topic_id, anon_team, anon_run
+        Returns (None, None) if record should be skipped.
+        """
         try:
             data = json.loads(line)
         except json.JSONDecodeError as e:
@@ -313,7 +352,9 @@ class ReportTransformer:
                 f"JSON parse error: {e}",
                 original_value=line[:200],
             )
-            return None
+            return None, None
+
+        fingerprint_info = None
 
         # Check and repair metadata fields
         if "metadata" in data:
@@ -323,31 +364,63 @@ class ReportTransformer:
             if "creator" in meta:
                 del meta["creator"]
 
+            # Get team_id early for team-scoped repair rules
+            current_team = meta.get("team_id", "")
+
             # Check narrative field type (common issue)
             if "narrative" in meta:
                 _, skip = self._check_field_type(
-                    data, "metadata.narrative", str, file_path, line_num
+                    data, "metadata.narrative", str, file_path, line_num,
+                    team_id=current_team
                 )
                 if skip:
                     self.errors.add_skipped_record(
                         file_path, line_num, "Skipped due to malformed narrative", data
                     )
-                    return None
+                    return None, None
+
+            # Capture original values BEFORE anonymization for fingerprinting
+            original_team = current_team
+            original_run = meta.get("run_id", "")
+
+            # Parse into Report model to get correctly resolved topic_id and text
+            try:
+                report = Report.model_validate(data)
+                topic_id = report.metadata.topic_id
+                report_text = report.get_text()
+            except Exception:
+                # If Report validation fails, skip fingerprinting but continue
+                topic_id = ""
+                report_text = ""
 
             # Anonymize team_id
+            anon_team = ""
             if "team_id" in meta and meta["team_id"]:
-                orig_team = meta["team_id"]
-                meta["team_id"] = self.mapping.get_or_create_team(orig_team)
+                anon_team = self.mapping.get_or_create_team(original_team)
+                meta["team_id"] = anon_team
 
             # Anonymize run_id
+            anon_run = ""
             if "run_id" in meta and meta["run_id"]:
-                orig_run = meta["run_id"]
-                meta["run_id"] = self.mapping.get_or_create_run(orig_run)
+                anon_run = self.mapping.get_or_create_run(original_run)
+                meta["run_id"] = anon_run
+
+            # Compute fingerprint if we have all required data
+            if original_team and original_run and topic_id and report_text:
+                fingerprint = compute_report_fingerprint(topic_id, report_text)
+                fingerprint_info = {
+                    "fingerprint": fingerprint,
+                    "original_team": original_team,
+                    "original_run": original_run,
+                    "topic_id": topic_id,
+                    "anon_team": anon_team,
+                    "anon_run": anon_run,
+                }
 
             # Check for email addresses
             self._scan_for_emails(meta, "metadata", file_path, line_num)
 
-        return json.dumps(data, separators=(",", ":"))
+        return json.dumps(data, separators=(",", ":")), fingerprint_info
 
     def _scan_for_emails(
         self,
@@ -428,10 +501,13 @@ class ReportTransformer:
                 line = line.strip()
                 if not line:
                     continue
-                result = self.transform_line(line, input_path, line_num)
+                result, fingerprint_info = self.transform_line(line, input_path, line_num)
                 if result:
                     fout.write(result + "\n")
                     count += 1
+                    # Store fingerprint if available
+                    if fingerprint_info:
+                        self.mapping.store_fingerprint(**fingerprint_info)
         return count
 
 
@@ -550,7 +626,6 @@ class TsvTransformer:
                 parts = stripped.split()
                 for col_idx in run_id_columns:
                     if col_idx < len(parts):
-                        # Handle team-run patterns
                         original = parts[col_idx]
                         parts[col_idx] = self._anonymize_value(original)
 
@@ -560,38 +635,57 @@ class TsvTransformer:
         return count
 
     def _anonymize_value(self, value: str) -> str:
-        """Anonymize a value that might be team-run or just run_id."""
-        # Check for team-run pattern (e.g., "team1-run1")
-        for sep in ["-", "_", "."]:
-            if sep in value:
-                parts = value.split(sep, 1)
-                if len(parts) == 2:
-                    team_part, run_part = parts
-                    anon_team = self.mapping.get_or_create_team(team_part)
-                    anon_run = self.mapping.get_or_create_run(run_part)
-                    return f"{anon_team}{sep}{anon_run}"
+        """Anonymize a run_id value.
 
-        # Might be just run_id
-        return self.mapping.get_or_create_run(value)
+        The value is treated as a run_id and looked up in the mapping.
+        """
+        run_map = self.mapping.get_all_run_mappings()
+
+        # Check if value matches a known run_id
+        if value in run_map:
+            return run_map[value]
+
+        # Not found - return as-is (or could create new mapping)
+        return value
 
 
 def anonymize_filename(
     filename: str,
     mapping: MappingStore,
 ) -> str:
-    """Anonymize team/run patterns in a filename."""
-    result = filename
+    """Anonymize run_id in a filename.
 
-    # Get existing mappings
-    team_map = mapping.get_all_team_mappings()
+    Run files typically have format: {run_id} (no extension, no team prefix)
+    The entire filename IS the run_id.
+
+    If not already mapped, creates a new mapping.
+    """
+    return mapping.get_or_create_run(filename)
+
+
+def anonymize_eval_filename(
+    filename: str,
+    mapping: MappingStore,
+) -> str:
+    """Anonymize eval filename with format {run_id}.{judge}.
+
+    Eval files have format: {run_id}.{judge}
+    Run_id may contain dots, so we do prefix matching against known run_ids.
+    We match the longest known run_id that is a prefix of the filename.
+
+    Example: "my.run.v1.nist-edit" -> "007.nist-edit" (if "my.run.v1" is known)
+    """
     run_map = mapping.get_all_run_mappings()
 
-    # Replace team-run combinations first (more specific)
-    for orig_team, anon_team in team_map.items():
-        for orig_run, anon_run in run_map.items():
-            for sep in ["-", "_", "."]:
-                old = f"{orig_team}{sep}{orig_run}"
-                new = f"{anon_team}{sep}{anon_run}"
-                result = result.replace(old, new)
+    # Sort by length descending to match longest prefix first
+    sorted_runs = sorted(run_map.keys(), key=len, reverse=True)
 
-    return result
+    for orig_run in sorted_runs:
+        # Check if filename starts with run_id followed by a dot
+        prefix = orig_run + "."
+        if filename.startswith(prefix):
+            anon_run = run_map[orig_run]
+            # Replace run_id prefix, keep the rest (.judge extension)
+            return anon_run + filename[len(orig_run):]
+
+    return filename  # No match found

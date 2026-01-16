@@ -7,7 +7,7 @@ from io import StringIO
 from pathlib import Path
 import json
 from pydantic import BaseModel, ConfigDict, Field
-from trec_auto_judge.document.document import Document
+
 
 class TaskType(str, Enum):
     """Ragtime tasks"""
@@ -114,7 +114,7 @@ class Report(BaseModel):
     answer:Optional[List[NeuclirReportSentence]|List[RagtimeReportSentence]|List[Rag24ReportSentence]]=None
     path:Optional[Path]=Field(default=None, exclude=True)
     references:Optional[List[str]]=None  # index resolves to document id for `RAG25ReportSentence`
-    documents:Optional[Dict[str,Document]] = None
+    documents:Optional[Dict[str,Any]] = None
     
     
     def model_post_init(self, __context__: dict | None = None) -> None:
@@ -137,9 +137,9 @@ class Report(BaseModel):
     def get_text(self) -> str:
         return self.get_report_text()
     
-    def get_paragraphs(self) ->List[str]:
-        from nuggety.text_chunker import  get_paragraph_chunks
-        return get_paragraph_chunks(self.get_text())
+    # def get_paragraphs(self) ->List[str]:
+    #     from nuggety.text_chunker import  get_paragraph_chunks
+    #     return get_paragraph_chunks(self.get_text())
     
     def get_sentences(self) ->List[str]:
         return [s.text for s in self.responses]

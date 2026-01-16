@@ -7,6 +7,7 @@ Directory structure expected:
         metadata/{task}/*.jl        # Metadata JSONL
 """
 
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
@@ -22,6 +23,7 @@ from .transformers import (
     TsvFormatHint,
     detect_tsv_format,
     anonymize_filename,
+    anonymize_eval_filename,
 )
 
 
@@ -144,7 +146,10 @@ class AnonymizationPipeline:
             # Use hint
             return hint.likely_format, hint.run_id_columns
 
-        print(f"\nDetected TSV format for {file_path.name}:")
+        task_name = file_path.parent.name
+        print(f"\nDetected TSV format:")
+        print(f"  Task: {task_name}")
+        print(f"  File: {file_path}")
 
         # Show first data line as sample
         if sample_lines:
@@ -275,8 +280,8 @@ class AnonymizationPipeline:
     def _scan_metadata_for_priority(self, meta_dir: Path):
         """Scan metadata files to build priority map.
 
-        Maps run identifiers to their priority values.
-        Keys are stored as "{team}-{run}" to match filenames.
+        Maps run identifiers (runtag) to their priority values.
+        Keys are stored as run_id to match filenames (which are just {run_id}).
         """
         import json
 
@@ -296,26 +301,24 @@ class AnonymizationPipeline:
                                 continue
                             try:
                                 data = json.loads(line)
-                                team = data.get("org", "")
                                 run = data.get("runtag", "")
                                 priority = data.get("std-priority", "")
 
-                                if team and run:
-                                    # Store with team-run key to match filenames
-                                    key = f"{team}-{run}"
-                                    self._priority_map[key] = priority
+                                if run:
+                                    # Store with run_id key to match filenames
+                                    self._priority_map[run] = priority
                             except json.JSONDecodeError:
                                 continue
                 except IOError:
                     continue
 
     def _extract_run_id_from_filename(self, filename: str) -> Optional[str]:
-        """Extract the {team}-{run} part from a filename.
+        """Extract the run_id from a filename.
 
-        Filenames have format: {team}-{run} or {team}-{run}.{judge}
-        where team, run, and judge can all contain dots.
+        Run files: filename IS the run_id
+        Eval files: {run_id}.{judge} where run_id may contain dots
 
-        Uses known run identifiers from metadata to find the correct split.
+        Uses known run identifiers from metadata to find the correct match.
         """
         # If we have metadata, match against known identifiers
         if self._priority_map:
@@ -325,10 +328,9 @@ class AnonymizationPipeline:
                 if filename == run_id or filename.startswith(run_id + "."):
                     return run_id
 
-        # Fallback: assume no dots in team-run (first part before dot)
-        # This handles cases where metadata isn't available
-        if "." in filename:
-            return filename.split(".")[0]
+        # Fallback: for run files, filename IS the run_id
+        # For eval files without metadata, we can't reliably extract run_id
+        # since run_id may contain dots
         return filename
 
     def _should_include_file(self, filename: str) -> bool:
@@ -419,72 +421,119 @@ class AnonymizationPipeline:
             if not task_dir.is_dir():
                 continue
 
-            # Set current task context for email handler
-            self.report_transformer._current_task = task_dir.name
+            self._process_runs_task(task_dir, input_dir, output_dir)
 
-            # Track format for this task (all files in a task should be same format)
-            task_format = None
-            task_tsv_cols = None
+    def _process_runs_task(self, task_dir: Path, input_dir: Path, output_dir: Path):
+        """Process a single task directory in runs/."""
+        # Set current task context for email handler
+        self.report_transformer._current_task = task_dir.name
 
-            for run_file in task_dir.iterdir():
-                if run_file.is_dir():
-                    continue
+        # Track format for this task (all files in a task should be same format)
+        task_format = None
+        task_tsv_cols = None
+        unrenamed_files: List[Path] = []
 
-                # Check priority filter
-                if not self._should_include_file(run_file.name):
-                    rel_path = run_file.relative_to(input_dir)
-                    print(f"  [filtered] {rel_path}")
-                    self.stats.files_filtered += 1
-                    continue
+        for run_file in task_dir.iterdir():
+            if run_file.is_dir():
+                continue
 
+            # Check priority filter
+            if not self._should_include_file(run_file.name):
                 rel_path = run_file.relative_to(input_dir)
+                print(f"  [filtered] {rel_path}")
+                self.stats.files_filtered += 1
+                continue
 
-                if self.config.dry_run:
-                    print(f"  [dry-run] Would process: {rel_path}")
-                    continue
+            rel_path = run_file.relative_to(input_dir)
 
-                # Detect format on first file
-                if task_format is None:
-                    task_format = self._detect_file_format(run_file)
-                    if task_format == "tsv":
-                        # Detect TSV format and get run_id columns
-                        with open(run_file, "r") as f:
-                            sample_lines = f.readlines()[:20]
-                        hint = detect_tsv_format(sample_lines)
-                        fmt, task_tsv_cols = self._ask_tsv_format(
-                            run_file, hint, sample_lines
-                        )
-                        if fmt != TsvFormat.UNKNOWN:
-                            print(f"  (Detected {fmt.value} format for runs in {task_dir.name}/)")
+            if self.config.dry_run:
+                print(f"  [dry-run] Would process: {rel_path}")
+                continue
 
-                # Process based on format
-                temp_output = output_dir / rel_path
+            # Detect format on first file
+            if task_format is None:
+                task_format = self._detect_file_format(run_file)
+                if task_format == "tsv":
+                    # Detect TSV format and get run_id columns
+                    with open(run_file, "r") as f:
+                        sample_lines = f.readlines()[:20]
+                    hint = detect_tsv_format(sample_lines)
+                    fmt, task_tsv_cols = self._ask_tsv_format(
+                        run_file, hint, sample_lines
+                    )
+                    if fmt != TsvFormat.UNKNOWN:
+                        print(f"  (Detected {fmt.value} format for runs in {task_dir.name}/)")
+
+            # Process based on format
+            temp_output = output_dir / rel_path
+            if task_format == "jsonl":
+                lines = self.report_transformer.transform_file(run_file, temp_output)
+            else:
+                # TSV format (ranking file)
+                if task_tsv_cols:
+                    lines = self.tsv_transformer.transform_file(
+                        run_file, temp_output, task_tsv_cols
+                    )
+                else:
+                    # Unknown format, just copy
+                    temp_output.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(run_file, temp_output)
+                    lines = sum(1 for _ in open(run_file))
+
+            self.stats.files_processed += 1
+            self.stats.lines_processed += lines
+
+            # Rename output file with anonymized name
+            anon_filename = anonymize_filename(run_file.name, self.mapping)
+            if anon_filename != run_file.name:
+                final_output = temp_output.parent / anon_filename
+                temp_output.rename(final_output)
+                print(f"  {rel_path} -> {rel_path.parent / anon_filename}")
+            else:
+                # For JSONL files, unrenamed is unexpected (mapping should be created)
+                # For TSV files, unrenamed means filename didn't match any run_id
                 if task_format == "jsonl":
-                    lines = self.report_transformer.transform_file(run_file, temp_output)
-                else:
-                    # TSV format (ranking file)
-                    if task_tsv_cols:
-                        lines = self.tsv_transformer.transform_file(
-                            run_file, temp_output, task_tsv_cols
-                        )
-                    else:
-                        # Unknown format, just copy
-                        temp_output.parent.mkdir(parents=True, exist_ok=True)
-                        import shutil
-                        shutil.copy2(run_file, temp_output)
-                        lines = sum(1 for _ in open(run_file))
-
-                self.stats.files_processed += 1
-                self.stats.lines_processed += lines
-
-                # Rename output file with anonymized name
-                anon_filename = anonymize_filename(run_file.name, self.mapping)
-                if anon_filename != run_file.name:
-                    final_output = temp_output.parent / anon_filename
-                    temp_output.rename(final_output)
-                    print(f"  {rel_path} -> {rel_path.parent / anon_filename}")
-                else:
                     print(f"  {rel_path}")
+                else:
+                    print(f"  [WARNING] {rel_path} - filename not anonymized!")
+                    unrenamed_files.append(run_file)
+
+        # Check for unrenamed files (only relevant for TSV run files)
+        if unrenamed_files and self.config.interactive:
+            self._handle_unrenamed_run_files(task_dir, input_dir, output_dir, unrenamed_files)
+
+    def _handle_unrenamed_run_files(
+        self,
+        task_dir: Path,
+        input_dir: Path,
+        output_dir: Path,
+        unrenamed_files: List[Path],
+    ):
+        """Handle run files that weren't renamed."""
+        print(f"\n{'='*60}")
+        print(f"WARNING: {len(unrenamed_files)} run file(s) in task '{task_dir.name}' were not anonymized!")
+        print(f"This may indicate:")
+        print(f"  - Filename doesn't match the run_id in the file content")
+        print(f"  - Wrong TSV format was selected")
+        print(f"\nAffected files:")
+        for f in unrenamed_files[:5]:
+            print(f"  - {f.name}")
+        if len(unrenamed_files) > 5:
+            print(f"  ... and {len(unrenamed_files) - 5} more")
+
+        options = [
+            ("Continue anyway", "continue"),
+            ("Delete output for this task and skip", "skip"),
+        ]
+
+        choice = self.ask_fn("How to proceed?", options)
+        action = options[choice][1]
+
+        if action == "skip":
+            task_output_dir = output_dir / task_dir.name
+            if task_output_dir.exists():
+                shutil.rmtree(task_output_dir)
+            print(f"  Skipped task '{task_dir.name}'")
 
     def _process_eval(self, input_dir: Path, output_dir: Path):
         """Process eval/ directory (TSV files)."""
@@ -494,67 +543,146 @@ class AnonymizationPipeline:
             if not task_dir.is_dir():
                 continue
 
-            for eval_file in task_dir.iterdir():
-                if eval_file.is_dir():
-                    continue
+            self._process_eval_task(task_dir, input_dir, output_dir)
 
-                # Check priority filter
-                if not self._should_include_file(eval_file.name):
-                    rel_path = eval_file.relative_to(input_dir)
-                    print(f"  [filtered] {rel_path}")
-                    self.stats.files_filtered += 1
-                    continue
+    def _process_eval_task(self, task_dir: Path, input_dir: Path, output_dir: Path):
+        """Process a single task directory in eval/. May retry on user request."""
+        unrenamed_files: List[Path] = []
 
+        for eval_file in task_dir.iterdir():
+            if eval_file.is_dir():
+                continue
+
+            # Check priority filter
+            if not self._should_include_file(eval_file.name):
                 rel_path = eval_file.relative_to(input_dir)
+                print(f"  [filtered] {rel_path}")
+                self.stats.files_filtered += 1
+                continue
 
-                # Check if we have a cached format for this task directory
-                if task_dir in self._task_format_cache:
-                    fmt, run_id_cols = self._task_format_cache[task_dir]
+            rel_path = eval_file.relative_to(input_dir)
+
+            # Check if we have a cached format for this task directory
+            if task_dir in self._task_format_cache:
+                fmt, run_id_cols = self._task_format_cache[task_dir]
+            else:
+                # Detect format for first file in this task
+                with open(eval_file, "r") as f:
+                    sample_lines = f.readlines()[:20]
+
+                hint = detect_tsv_format(sample_lines)
+
+                # Check for override
+                override_key = str(rel_path)
+                if override_key in self.config.tsv_formats:
+                    fmt = self.config.tsv_formats[override_key]
+                    run_id_cols = self._get_run_id_columns(fmt)
                 else:
-                    # Detect format for first file in this task
-                    with open(eval_file, "r") as f:
-                        sample_lines = f.readlines()[:20]
+                    fmt, run_id_cols = self._ask_tsv_format(eval_file, hint, sample_lines)
 
-                    hint = detect_tsv_format(sample_lines)
+                # Cache format for this task directory (even if no run_id columns, like trec_eval)
+                if fmt != TsvFormat.UNKNOWN:
+                    self._task_format_cache[task_dir] = (fmt, run_id_cols)
+                    if self.config.interactive:
+                        print(f"  (Using {fmt.value} format for all files in {task_dir.name}/)")
 
-                    # Check for override
-                    override_key = str(rel_path)
-                    if override_key in self.config.tsv_formats:
-                        fmt = self.config.tsv_formats[override_key]
-                        run_id_cols = self._get_run_id_columns(fmt)
-                    else:
-                        fmt, run_id_cols = self._ask_tsv_format(eval_file, hint, sample_lines)
+            if fmt == TsvFormat.UNKNOWN:
+                print(f"  [skip] {rel_path} (unknown format)")
+                continue
 
-                    # Cache format for this task directory (even if no run_id columns, like trec_eval)
-                    if fmt != TsvFormat.UNKNOWN:
-                        self._task_format_cache[task_dir] = (fmt, run_id_cols)
-                        if self.config.interactive:
-                            print(f"  (Using {fmt.value} format for all files in {task_dir.name}/)")
+            if self.config.dry_run:
+                print(f"  [dry-run] Would process: {rel_path} as {fmt.value}")
+                continue
 
-                if fmt == TsvFormat.UNKNOWN or not run_id_cols:
-                    print(f"  [skip] {rel_path} (no run_id columns)")
-                    continue
-
-                if self.config.dry_run:
-                    print(f"  [dry-run] Would process: {rel_path} as {fmt.value}")
-                    continue
-
-                # Process content
+            # For known formats without run_id columns (like trec_eval),
+            # copy the file but still anonymize the filename
+            if not run_id_cols:
                 temp_output = output_dir / rel_path
-                lines = self.tsv_transformer.transform_file(
-                    eval_file, temp_output, run_id_cols
-                )
+                temp_output.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(eval_file, temp_output)
                 self.stats.files_processed += 1
-                self.stats.lines_processed += lines
 
-                # Rename output file
-                anon_filename = anonymize_filename(eval_file.name, self.mapping)
+                # Eval filename format: {run_id}.{judge}
+                anon_filename = anonymize_eval_filename(eval_file.name, self.mapping)
                 if anon_filename != eval_file.name:
                     final_output = temp_output.parent / anon_filename
                     temp_output.rename(final_output)
-                    print(f"  {rel_path} -> {rel_path.parent / anon_filename}")
+                    print(f"  {rel_path} -> {rel_path.parent / anon_filename} (content unchanged)")
                 else:
-                    print(f"  {rel_path}")
+                    print(f"  [WARNING] {rel_path} - filename not anonymized!")
+                    unrenamed_files.append(eval_file)
+                continue
+
+            # Process content (anonymize run_id columns)
+            temp_output = output_dir / rel_path
+            lines = self.tsv_transformer.transform_file(
+                eval_file, temp_output, run_id_cols
+            )
+            self.stats.files_processed += 1
+            self.stats.lines_processed += lines
+
+            # Rename output file (eval format: {run_id}.{judge})
+            anon_filename = anonymize_eval_filename(eval_file.name, self.mapping)
+            if anon_filename != eval_file.name:
+                final_output = temp_output.parent / anon_filename
+                temp_output.rename(final_output)
+                print(f"  {rel_path} -> {rel_path.parent / anon_filename}")
+            else:
+                print(f"  [WARNING] {rel_path} - filename not anonymized!")
+                unrenamed_files.append(eval_file)
+
+        # Check for unrenamed files and offer retry
+        if unrenamed_files and self.config.interactive:
+            self._handle_unrenamed_files(task_dir, input_dir, output_dir, unrenamed_files)
+
+    def _handle_unrenamed_files(
+        self,
+        task_dir: Path,
+        input_dir: Path,
+        output_dir: Path,
+        unrenamed_files: List[Path],
+    ):
+        """Handle files that weren't renamed - warn user and offer retry."""
+        print(f"\n{'='*60}")
+        print(f"WARNING: {len(unrenamed_files)} file(s) in task '{task_dir.name}' were not anonymized!")
+        print(f"This may indicate:")
+        print(f"  - Wrong TSV format was selected")
+        print(f"  - Input filenames don't match expected {{run_id}}.{{judge}} pattern")
+        print(f"  - Run files weren't processed first (mappings not established)")
+        print(f"\nAffected files:")
+        for f in unrenamed_files[:5]:  # Show first 5
+            print(f"  - {f.name}")
+        if len(unrenamed_files) > 5:
+            print(f"  ... and {len(unrenamed_files) - 5} more")
+
+        options = [
+            ("Continue anyway (files copied but not anonymized)", "continue"),
+            ("Retry this task with different format selection", "retry"),
+            ("Delete output for this task and skip", "skip"),
+        ]
+
+        choice = self.ask_fn("How to proceed?", options)
+        action = options[choice][1]
+
+        if action == "retry":
+            # Clear cache and output for this task
+            if task_dir in self._task_format_cache:
+                del self._task_format_cache[task_dir]
+
+            # Remove output directory for this task
+            task_output_dir = output_dir / task_dir.name
+            if task_output_dir.exists():
+                shutil.rmtree(task_output_dir)
+
+            print(f"\nRetrying task '{task_dir.name}'...")
+            self._process_eval_task(task_dir, input_dir, output_dir)
+
+        elif action == "skip":
+            # Remove output directory for this task
+            task_output_dir = output_dir / task_dir.name
+            if task_output_dir.exists():
+                shutil.rmtree(task_output_dir)
+            print(f"  Skipped task '{task_dir.name}'")
 
     def _process_metadata(self, input_dir: Path, output_dir: Path):
         """Process metadata/ directory (Metadata JSONL files)."""
@@ -595,11 +723,9 @@ class AnonymizationPipeline:
                             # Check if this line matches priority filter
                             try:
                                 data = json.loads(line)
-                                team = data.get("org", "")
                                 run = data.get("runtag", "")
-                                key = f"{team}-{run}"
 
-                                if not self._should_include_file(key):
+                                if not self._should_include_file(run):
                                     lines_filtered += 1
                                     continue
                             except json.JSONDecodeError:

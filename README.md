@@ -31,7 +31,10 @@ uv run trec-anon anonymize \
 uv run trec-anon show-mapping -m mapping.db
 
 # Reverse lookup
-uv run trec-anon reverse-lookup -m mapping.db Fez-07
+uv run trec-anon reverse-lookup -m mapping.db Fez-007
+
+# Recover mappings from anonymized reports (if mapping.db is lost)
+uv run trec-anon recover-mapping -m mapping.db -i anon_data/runs/
 
 # Example with test data
 uv run trec-anon anonymize \
@@ -111,13 +114,13 @@ The goal is to share runs and eval data while hiding team and run identifiers to
 | Original | Anonymized | Format |
 |----------|------------|--------|
 | team     | 3-letter CVC code | e.g., "Bax", "Cog", "Fez" |
-| run_id   | 2-digit number | e.g., "07", "42", "93" |
+| run_id   | 3-digit number | e.g., "007", "042", "196" |
 
 Anonymization is applied to:
-- **Filenames**: `team1-run1.judge` → `Bax-07.judge`
+- **Filenames**: `team1-run1.judge` → `Bax-007.judge`
 - **JSONL content**: `team_id`, `run_id` fields in reports and metadata
-- **TSV content**: run_id columns (column depends on format)
-- **Email addresses**: Detected and redacted to `[REDACTED]`
+- **TSV content**: run_id columns (auto-detected or interactively confirmed)
+- **Email addresses**: Detected and handled interactively (redact, ignore, or drop field)
 
 ### Mapping persistence
 
@@ -129,4 +132,33 @@ Mappings are stored in a SQLite database for:
 ### Priority filtering
 
 Runs can be filtered by priority using metadata's `std-priority` field. Only runs matching the specified priority are included in the output.
+
+### TSV format detection
+
+The tool auto-detects TSV file formats based on:
+- **Header rows**: Recognizes column names like `run_id`, `request_id`, `metric`, `value`
+- **Column count**: 3 columns = trec_eval, 4 columns = tot/ir_measures, 6 columns = ranking/qrels
+- **Content patterns**: Numeric values indicate data rows, not headers
+
+In interactive mode, detected formats are confirmed with the user. Format decisions are cached per task directory.
+
+### Fingerprint-based mapping recovery
+
+During anonymization, content fingerprints (SHA256 of topic_id + report text) are stored in the mapping database. If the mapping.db is available but you need to verify mappings against anonymized data:
+
+```bash
+# Recover/verify mappings from anonymized reports
+uv run trec-anon recover-mapping -m mapping.db -i anon_data/runs/ -f table
+uv run trec-anon recover-mapping -m mapping.db -i anon_data/runs/ -f csv -o recovered.csv
+```
+
+### Email handling
+
+Email addresses found in data trigger interactive prompts with options:
+- **Redact**: Replace with `[REDACTED]`
+- **Ignore**: Leave as-is
+- **Redact all**: Redact all emails in this field for the current task
+- **Drop field**: Remove the entire field containing the email
+
+Decisions are cached per (task, field) combination.
 

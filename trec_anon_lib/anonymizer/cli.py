@@ -191,6 +191,7 @@ def show_mapping(mapping_db: Path, output_format: str):
             click.echo("-" * 40)
             click.echo(f"  Teams mapped:      {stats['teams']}")
             click.echo(f"  Runs mapped:       {stats['runs']}")
+            click.echo(f"  Fingerprints:      {stats['fingerprints']}")
             click.echo(f"  Teams remaining:   {stats['teams_remaining']}")
             click.echo(f"  Runs remaining:    {stats['runs_remaining']}")
 
@@ -241,6 +242,176 @@ def reverse_lookup(mapping_db: Path, anonymized_value: str):
             return
 
         click.echo(f"No mapping found for: {anonymized_value}", err=True)
+
+
+@cli.command("recover-mapping")
+@click.option(
+    "--mapping", "-m",
+    "mapping_db",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+    help="SQLite database containing fingerprints from anonymization",
+)
+@click.option(
+    "--input", "-i",
+    "input_path",
+    type=click.Path(exists=True, path_type=Path),
+    required=True,
+    help="Anonymized report file (JSONL) or directory",
+)
+@click.option(
+    "--output", "-o",
+    "output_path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help="Output file for recovered mappings (default: stdout)",
+)
+@click.option(
+    "--format", "-f",
+    "output_format",
+    type=click.Choice(["table", "json", "csv"]),
+    default="table",
+    help="Output format (default: table)",
+)
+def recover_mapping(
+    mapping_db: Path,
+    input_path: Path,
+    output_path: Optional[Path],
+    output_format: str,
+):
+    """Recover original team/run mappings from anonymized reports.
+
+    Uses content fingerprints stored during anonymization to match
+    anonymized reports back to their original identifiers.
+
+    Example:
+        trec-anon recover-mapping -m mapping.db -i anon_reports.jsonl
+        trec-anon recover-mapping -m mapping.db -i anon_data/runs/ -f csv -o mappings.csv
+    """
+    import json as json_module
+    from io import StringIO
+    from typing import Dict, List
+
+    from .mapping import MappingStore, compute_report_fingerprint
+    from ..report import Report
+
+    with MappingStore(mapping_db) as store:
+        results: List[Dict] = []
+        unmatched: List[Dict] = []
+
+        # Collect all JSONL files
+        if input_path.is_dir():
+            files = list(input_path.rglob("*.jsonl")) + list(input_path.rglob("*.jl"))
+        else:
+            files = [input_path]
+
+        for file_path in files:
+            with open(file_path, "r") as f:
+                for line_num, line in enumerate(f, 1):
+                    line = line.strip()
+                    if not line:
+                        continue
+
+                    try:
+                        data = json_module.loads(line)
+                    except json_module.JSONDecodeError:
+                        continue
+
+                    # Parse into Report model for correct field resolution
+                    try:
+                        report = Report.model_validate(data)
+                        topic_id = report.topic_id
+                        report_text = report.get_text()
+                        anon_team = report.metadata.team_id or ""
+                        anon_run = report.metadata.run_id or ""
+                    except Exception:
+                        continue
+
+                    if not (topic_id and report_text):
+                        continue
+
+                    # Compute fingerprint and lookup
+                    fingerprint = compute_report_fingerprint(topic_id, report_text)
+                    match = store.lookup_fingerprint(fingerprint)
+
+                    if match:
+                        results.append({
+                            "file": str(file_path),
+                            "line": line_num,
+                            "topic_id": topic_id,
+                            "anon_team": anon_team,
+                            "anon_run": anon_run,
+                            "original_team": match["original_team"],
+                            "original_run": match["original_run"],
+                        })
+                    else:
+                        unmatched.append({
+                            "file": str(file_path),
+                            "line": line_num,
+                            "topic_id": topic_id,
+                            "anon_team": anon_team,
+                            "anon_run": anon_run,
+                        })
+
+        # Output results
+        output = _format_recovery_results(results, unmatched, output_format)
+
+        if output_path:
+            with open(output_path, "w") as f:
+                f.write(output)
+            click.echo(f"Results written to: {output_path}")
+            click.echo(f"Matched: {len(results)}, Unmatched: {len(unmatched)}")
+        else:
+            click.echo(output)
+
+
+def _format_recovery_results(
+    results: list,
+    unmatched: list,
+    output_format: str,
+) -> str:
+    """Format recovery results for output."""
+    import json as json_module
+    from io import StringIO
+
+    out = StringIO()
+
+    if output_format == "json":
+        data = {"matched": results, "unmatched": unmatched}
+        out.write(json_module.dumps(data, indent=2))
+
+    elif output_format == "csv":
+        out.write("topic_id,anon_team,anon_run,original_team,original_run,file,line\n")
+        for r in results:
+            out.write(f"{r['topic_id']},{r['anon_team']},{r['anon_run']},"
+                     f"{r['original_team']},{r['original_run']},"
+                     f"{r['file']},{r['line']}\n")
+        if unmatched:
+            out.write("\n# Unmatched entries:\n")
+            for r in unmatched:
+                out.write(f"# {r['topic_id']},{r['anon_team']},{r['anon_run']},"
+                         f"UNMATCHED,UNMATCHED,{r['file']},{r['line']}\n")
+
+    else:  # table
+        out.write("\nRecovered Mappings:\n")
+        out.write("=" * 80 + "\n")
+        if results:
+            out.write(f"{'Topic':<15} {'Anon Team':<15} {'Anon Run':<10} "
+                     f"{'Orig Team':<15} {'Orig Run':<10}\n")
+            out.write("-" * 80 + "\n")
+            for r in results:
+                out.write(f"{r['topic_id']:<15} {r['anon_team']:<15} "
+                         f"{r['anon_run']:<10} {r['original_team']:<15} "
+                         f"{r['original_run']:<10}\n")
+        else:
+            out.write("  (no matches found)\n")
+
+        if unmatched:
+            out.write(f"\nUnmatched: {len(unmatched)} reports\n")
+
+        out.write(f"\nSummary: {len(results)} matched, {len(unmatched)} unmatched\n")
+
+    return out.getvalue()
 
 
 def main():
