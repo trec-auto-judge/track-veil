@@ -31,7 +31,7 @@ uv run trec-anon anonymize \
 uv run trec-anon show-mapping -m mapping.db
 
 # Reverse lookup
-uv run trec-anon reverse-lookup -m mapping.db Fez-007
+uv run trec-anon reverse-lookup -m mapping.db T042-bear
 
 # Recover mappings from anonymized reports (if mapping.db is lost)
 uv run trec-anon recover-mapping -m mapping.db -i anon_data/runs/
@@ -112,11 +112,11 @@ The goal is to share runs and eval data while hiding team and run identifiers to
 
 | Original | Anonymized | Format |
 |----------|------------|--------|
-| team     | 3-letter CVC code | e.g., "Bax", "Cog", "Fez" |
-| run_id   | 3-digit number | e.g., "007", "042", "196" |
+| team     | "T" + 3-digit number | e.g., "T042", "T196", "T007" |
+| run_id   | plantimal name | e.g., "bear", "oak", "frog" |
 
 Anonymization is applied to:
-- **Filenames**: `team1-run1.judge` → `Bax-007.judge`
+- **Filenames**: `team1-run1.judge` → `T042-bear.judge`
 - **JSONL content**: `team_id`, `run_id` fields in reports and metadata
 - **TSV content**: run_id columns (auto-detected or interactively confirmed)
 - **Email addresses**: Detected and handled interactively (redact, ignore, or drop field)

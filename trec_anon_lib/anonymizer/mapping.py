@@ -64,6 +64,9 @@ class MappingStore:
         if team_idx is not None and run_idx is not None:
             self._pool.set_indices(int(team_idx), int(run_idx))
 
+        # Track run_id → original_team for cross-source consistency checks
+        self._run_to_team: Dict[str, str] = {}
+
     def _generate_seed(self) -> int:
         """Generate a random seed for new databases."""
         import secrets
@@ -99,6 +102,13 @@ class MappingStore:
                 anon_run TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS invalidated_names (
+                name_type TEXT NOT NULL,
+                name TEXT NOT NULL,
+                invalidated_at TEXT NOT NULL,
+                PRIMARY KEY (name_type, name)
+            );
             """
         )
         self._conn.commit()
@@ -122,6 +132,15 @@ class MappingStore:
         self._set_metadata("team_pool_index", str(self._pool._team_index))
         self._set_metadata("run_pool_index", str(self._pool._run_index))
 
+    def _record_invalidated_name(self, name_type: str, name: str):
+        """Record a name that was skipped due to collision."""
+        cur = self._conn.cursor()
+        cur.execute(
+            "INSERT OR IGNORE INTO invalidated_names (name_type, name, invalidated_at) VALUES (?, ?, ?)",
+            (name_type, name, datetime.now().isoformat()),
+        )
+        self._conn.commit()
+
     def get_or_create_team(self, original: str) -> str:
         """Get anonymized team name, creating mapping if needed."""
         cur = self._conn.cursor()
@@ -133,15 +152,21 @@ class MappingStore:
         if row:
             return row["anonymized"]
 
-        # Create new mapping
-        anon = self._pool.get_team_pseudonym()
-        cur.execute(
-            "INSERT INTO team_mappings (original, anonymized, created_at) VALUES (?, ?, ?)",
-            (original, anon, datetime.now().isoformat()),
-        )
-        self._conn.commit()
-        self._save_pool_state()
-        return anon
+        # Create new mapping, retry if collision
+        while True:
+            anon = self._pool.get_team_pseudonym()
+            try:
+                cur.execute(
+                    "INSERT INTO team_mappings (original, anonymized, created_at) VALUES (?, ?, ?)",
+                    (original, anon, datetime.now().isoformat()),
+                )
+                self._conn.commit()
+                self._save_pool_state()
+                return anon
+            except sqlite3.IntegrityError:
+                # Name already used - record as invalidated and try next
+                self._record_invalidated_name("team", anon)
+                continue
 
     def get_or_create_run(self, original: str) -> str:
         """Get anonymized run ID, creating mapping if needed."""
@@ -154,15 +179,21 @@ class MappingStore:
         if row:
             return row["anonymized"]
 
-        # Create new mapping
-        anon = self._pool.get_run_pseudonym()
-        cur.execute(
-            "INSERT INTO run_mappings (original, anonymized, created_at) VALUES (?, ?, ?)",
-            (original, anon, datetime.now().isoformat()),
-        )
-        self._conn.commit()
-        self._save_pool_state()
-        return anon
+        # Create new mapping, retry if collision
+        while True:
+            anon = self._pool.get_run_pseudonym()
+            try:
+                cur.execute(
+                    "INSERT INTO run_mappings (original, anonymized, created_at) VALUES (?, ?, ?)",
+                    (original, anon, datetime.now().isoformat()),
+                )
+                self._conn.commit()
+                self._save_pool_state()
+                return anon
+            except sqlite3.IntegrityError:
+                # Name already used - record as invalidated and try next
+                self._record_invalidated_name("run", anon)
+                continue
 
     def get_team(self, original: str) -> Optional[str]:
         """Get anonymized team name if it exists."""
@@ -183,6 +214,18 @@ class MappingStore:
         )
         row = cur.fetchone()
         return row["anonymized"] if row else None
+
+    def store_run_team(self, run_id: str, team: str):
+        """Store the association between a run_id and its original team.
+
+        Called when processing runs/ to track which team submitted each run.
+        Used later to detect mismatches when metadata has different team name.
+        """
+        self._run_to_team[run_id] = team
+
+    def get_run_team(self, run_id: str) -> Optional[str]:
+        """Get the original team associated with a run_id."""
+        return self._run_to_team.get(run_id)
 
     def get_all_team_mappings(self) -> Dict[str, str]:
         """Return all team mappings as {original: anonymized}."""

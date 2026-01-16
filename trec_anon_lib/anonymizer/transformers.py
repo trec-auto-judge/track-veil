@@ -414,6 +414,10 @@ class ReportTransformer:
                 anon_run = self.mapping.get_or_create_run(original_run)
                 meta["run_id"] = anon_run
 
+                # Store run→team association for cross-source consistency checks
+                if original_team:
+                    self.mapping.store_run_team(original_run, original_team)
+
             # Compute fingerprint if we have all required data
             if original_team and original_run and topic_id and report_text:
                 fingerprint = compute_report_fingerprint(topic_id, report_text)
@@ -543,6 +547,7 @@ class MetadataTransformer:
         self.email_handler = email_handler
         self._current_task: str = ""  # Set by caller before processing
         self._warned_runs: set = set()  # Track which runs we've warned about
+        self._warned_team_mismatches: set = set()  # Track (org, task) pairs we've warned about
 
     def transform_line(
         self,
@@ -564,9 +569,22 @@ class MetadataTransformer:
             )
             return None
 
-        # Anonymize org (team) - teams are expected to come from metadata
+        # Anonymize org (team) - check for mismatch with runs/ team
         if "org" in data and data["org"]:
-            data["org"] = self.mapping.get_or_create_team(data["org"])
+            org = data["org"]
+            runtag = data.get("runtag", "")
+
+            # Check if this run has a different team from runs/
+            if runtag:
+                expected_team = self.mapping.get_run_team(runtag)
+                if expected_team and expected_team != org:
+                    warn_key = (org, self._current_task)
+                    if warn_key not in self._warned_team_mismatches:
+                        self._warned_team_mismatches.add(warn_key)
+                        print(f"  [WARNING] Team mismatch for run '{runtag}': "
+                              f"metadata.org='{org}' vs runs.team_id='{expected_team}'")
+
+            data["org"] = self.mapping.get_or_create_team(org)
 
         # Anonymize runtag (run_id)
         # Warn if creating new mapping - run_id should normally come from runs/

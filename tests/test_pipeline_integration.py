@@ -398,13 +398,13 @@ class TestEvalContentReplacement:
         # Neither original run_id should appear
         assert "correct_run" not in content
         assert "wrong_run" not in content
-        # Content should have anonymized run_id (3-digit number)
+        # Content should have anonymized run_id (plantimal name)
         lines = content.strip().split("\n")
         for line in lines:
             parts = line.split("\t")
             assert len(parts) == 6
-            # run_id column should be a 3-digit number
-            assert parts[5].isdigit() and len(parts[5]) == 3
+            # run_id column should be a plantimal name (alphabetic, lowercase)
+            assert parts[5].isalpha() and parts[5].islower()
 
 
 class TestRunsContentReplacement:
@@ -442,10 +442,10 @@ class TestRunsContentReplacement:
         # Neither original run_id should appear
         assert "correct_run" not in content
         assert "wrong_run" not in content
-        # Content should have anonymized run_id (3-digit number)
+        # Content should have anonymized run_id (plantimal name)
         lines = content.strip().split("\n")
         for line in lines:
             parts = line.split("\t")
             assert len(parts) == 6
-            # run_id column should be a 3-digit number
-            assert parts[5].isdigit() and len(parts[5]) == 3
+            # run_id column should be a plantimal name (alphabetic, lowercase)
+            assert parts[5].isalpha() and parts[5].islower()
