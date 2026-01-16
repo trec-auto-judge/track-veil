@@ -1,0 +1,58 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "trec_anon"
+dynamic = ["version"]
+description = "Anonymizing trec data sets."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = [
+    "click",
+    "pandas",
+    "numpy",
+    "pydantic>=2.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0,<9",
+]
+
+[project.scripts]
+trec-auto-judge = "trec_anon:main"
+
+[project.urls]
+Homepage = "https://github.com/trec-auto-judge/trec_anon"
+# "Bug Tracker" = "https://github.com/trec-auto-judge/auto-judge-code/issues"
+
+[tool.hatch.version]
+path = "trec_anon_lib/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["trec_anon_lib"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = ["E203"]
