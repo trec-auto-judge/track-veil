@@ -80,10 +80,9 @@ Nested list denotes subdirectory structure. File are either jsonl or "white-spac
 - {trackname}-export   # export for each track
   - runs                                #  submitted systems (aka runs)
      - {task}                            # directory for each task
-       - {run_id}                        #  file for each run forat "report"| "qrels" | "ranking"
+       - {run_id}                        #  file for each run, format: "report" | "ranking"
                                          #  "report":  jsonl file with  "{"metadata": {"team_id": "{team}", "run_id": "{run_id}", ...}, ...}"  (load with `report.py#load_report`)
-                                         #  "ranking": trec_eval run file: "{topic} Q0 {doc_id} {rank} {score} {run_id_or_comment}"
-                                         #  "qrels": "{topic} Q0 {doc_id} {grade} {is_relevant} {run_id}"
+                                         #  "ranking": trec_eval run file: "{topic} Q0 {doc_id} {rank} {score} {run_id}"
   - eval                                 #  per topic/team/run evaluation results
      - {task}
        - {run_id}.{judge}                 # leaderboard in either in format "tot" | "trec_eval" | "ir_measures" | else
@@ -93,7 +92,7 @@ Nested list denotes subdirectory structure. File are either jsonl or "white-spac
                                           
   - metadata  # data from form upload
      - {task}
-        - trec2025-{rackname}-{task}.jl   # json lines with meta information for each run from web upload form. format
+        - trec2025-{trackname}-{task}.jl   # json lines with meta information for each run from web upload form. format
                                           # { "runtag": "{run_id}",  "org": "{team}", "std-priority": "{priority}", ...}
 
     
@@ -137,10 +136,28 @@ Runs can be filtered by priority using metadata's `std-priority` field. Only run
 
 The tool auto-detects TSV file formats based on:
 - **Header rows**: Recognizes column names like `run_id`, `request_id`, `metric`, `value`
-- **Column count**: 3 columns = trec_eval, 4 columns = tot/ir_measures, 6 columns = ranking/qrels
+- **Column count**: 3 columns = trec_eval, 4 columns = tot/ir_measures, 6 columns with Q0 = ranking
 - **Content patterns**: Numeric values indicate data rows, not headers
 
 In interactive mode, detected formats are confirmed with the user. Format decisions are cached per task directory.
+
+### Filename as source of truth
+
+For both `runs/` and `eval/` files, the **filename is the source of truth** for the run_id. Even if the file content contains a different run_id value, it will be replaced with the anonymized run_id derived from the filename.
+
+This ensures consistency when:
+- Content run_id values are incorrect or inconsistent
+- Multiple files need to be processed with the same mapping
+
+### trec_eval format handling
+
+For trec_eval format files (3 columns: `{measure} {topic} {value}`), the special `runid` metric line is anonymized:
+
+```
+runid    all    original_run_name  →  runid    all    anonymized_run_id
+```
+
+Both tab-separated and space-separated files are supported.
 
 ### Fingerprint-based mapping recovery
 

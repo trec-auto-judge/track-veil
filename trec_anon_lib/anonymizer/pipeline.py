@@ -298,17 +298,10 @@ class AnonymizationPipeline:
                     continue
 
                 parts = stripped.split()  # Handle both tabs and spaces
-                # Check for runid metric in either column 0 or column 1
-                # Format can be: "runid all value" or "all runid value"
-                if len(parts) >= 3:
-                    if parts[0].lower() == "runid":
-                        parts[2] = anon_run_id
-                        f_out.write("\t".join(parts) + "\n")
-                    elif parts[1].lower() == "runid":
-                        parts[2] = anon_run_id
-                        f_out.write("\t".join(parts) + "\n")
-                    else:
-                        f_out.write(line)
+                # Check for runid metric line: "runid <topic> <value>"
+                if len(parts) >= 3 and parts[0].lower() == "runid":
+                    parts[2] = anon_run_id
+                    f_out.write("\t".join(parts) + "\n")
                 else:
                     f_out.write(line)
 

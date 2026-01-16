@@ -1,0 +1,3 @@
+run_id	topic_id	metric	value
+team1-run1	1	ndcg	0.5
+team2-run2	1	ndcg	0.6
