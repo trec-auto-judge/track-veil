@@ -23,6 +23,13 @@ class IssueType(str, Enum):
     SKIPPED_RECORD = "skipped_record"
 
 
+class EmailAction(str, Enum):
+    """Actions for handling email addresses."""
+    REDACT = "redact"       # Replace with [REDACTED]
+    IGNORE = "ignore"       # Leave as-is
+    REDACT_ALL = "redact_all"  # Redact all for this field+task
+
+
 @dataclass
 class DataIssue:
     """A single data issue found during processing."""

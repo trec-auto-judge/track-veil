@@ -15,7 +15,11 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 from .mapping import MappingStore
 from .repairs import RepairRule, RepairStore, suggest_repair_options
-from .errors import ErrorCollector, IssueType
+from .errors import ErrorCollector, IssueType, EmailAction
+
+# Type alias for email handler callback
+# Signature: (task: str, field_path: str, email: str, file_path: Path) -> EmailAction
+EmailHandler = Callable[[str, str, str, Path], EmailAction]
 
 
 EMAIL_PATTERN = re.compile(
@@ -200,12 +204,15 @@ class ReportTransformer:
         errors: ErrorCollector,
         interactive: bool = True,
         ask_fn: Optional[Callable[[str, List[Tuple[str, Any]]], int]] = None,
+        email_handler: Optional[EmailHandler] = None,
     ):
         self.mapping = mapping
         self.repairs = repairs
         self.errors = errors
         self.interactive = interactive
         self.ask_fn = ask_fn or self._default_ask
+        self.email_handler = email_handler
+        self._current_task: str = ""  # Set by caller before processing
 
     def _default_ask(self, prompt: str, options: List[Tuple[str, Any]]) -> int:
         """Default interactive prompt."""
@@ -344,18 +351,45 @@ class ReportTransformer:
         path: str,
         file_path: Path,
         line_num: int,
+        parent: Any = None,
+        parent_key: Any = None,
     ):
-        """Recursively scan for email addresses."""
+        """Recursively scan for email addresses and optionally redact.
+
+        Args:
+            obj: The object to scan
+            path: JSON path for display (e.g., "metadata.creator.contact")
+            file_path: Source file for error reporting
+            line_num: Line number for error reporting
+            parent: Parent object (dict or list) for in-place modification
+            parent_key: Key or index in parent for in-place modification
+        """
         if isinstance(obj, str):
             emails = EMAIL_PATTERN.findall(obj)
             for email in emails:
                 self.errors.add_email_warning(file_path, line_num, path, email)
+
+                # Check with handler if we should redact
+                if self.email_handler and parent is not None:
+                    action = self.email_handler(
+                        self._current_task, path, email, file_path
+                    )
+                    if action == EmailAction.REDACT:
+                        # Redact in place
+                        redacted = EMAIL_PATTERN.sub("[REDACTED]", parent[parent_key])
+                        parent[parent_key] = redacted
         elif isinstance(obj, dict):
             for key, value in obj.items():
-                self._scan_for_emails(value, f"{path}.{key}", file_path, line_num)
+                self._scan_for_emails(
+                    value, f"{path}.{key}", file_path, line_num,
+                    parent=obj, parent_key=key
+                )
         elif isinstance(obj, list):
             for i, item in enumerate(obj):
-                self._scan_for_emails(item, f"{path}[{i}]", file_path, line_num)
+                self._scan_for_emails(
+                    item, f"{path}[{i}]", file_path, line_num,
+                    parent=obj, parent_key=i
+                )
 
     def transform_file(
         self,
@@ -384,9 +418,12 @@ class MetadataTransformer:
         self,
         mapping: MappingStore,
         errors: ErrorCollector,
+        email_handler: Optional[EmailHandler] = None,
     ):
         self.mapping = mapping
         self.errors = errors
+        self.email_handler = email_handler
+        self._current_task: str = ""  # Set by caller before processing
 
     def transform_line(
         self,
@@ -418,11 +455,19 @@ class MetadataTransformer:
 
         # Check for email field
         if "email" in data and data["email"]:
-            self.errors.add_email_warning(
-                file_path, line_num, "email", data["email"]
-            )
-            # Redact email
-            data["email"] = "[REDACTED]"
+            email = data["email"]
+            self.errors.add_email_warning(file_path, line_num, "email", email)
+
+            # Check with handler if we should redact
+            should_redact = True  # Default to redact
+            if self.email_handler:
+                action = self.email_handler(
+                    self._current_task, "email", email, file_path
+                )
+                should_redact = (action == EmailAction.REDACT)
+
+            if should_redact:
+                data["email"] = "[REDACTED]"
 
         return json.dumps(data, separators=(",", ":"))
 

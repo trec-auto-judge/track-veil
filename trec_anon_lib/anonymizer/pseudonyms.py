@@ -49,13 +49,13 @@ class PseudonymPool:
     Usage:
         pool = PseudonymPool(seed=42)
         team_anon = pool.get_team_pseudonym()  # e.g., "Fez"
-        run_anon = pool.get_run_pseudonym()    # e.g., "07"
+        run_anon = pool.get_run_pseudonym()    # e.g., "007"
     """
 
     def __init__(self, seed: Optional[int] = None):
         self._seed = seed
         self._team_pool = generate_cvc_pool(seed)
-        self._run_pool = generate_digit_pool(digits=2, seed=seed)
+        self._run_pool = generate_digit_pool(digits=3, seed=seed)
         self._team_index = 0
         self._run_index = 0
 

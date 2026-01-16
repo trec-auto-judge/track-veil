@@ -13,7 +13,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from .mapping import MappingStore
 from .repairs import RepairStore
-from .errors import ErrorCollector
+from .errors import ErrorCollector, EmailAction
 from .transformers import (
     ReportTransformer,
     MetadataTransformer,
@@ -85,22 +85,34 @@ class AnonymizationPipeline:
         # Priority map: {(team, run) -> priority} or {run_id -> priority}
         self._priority_map: Dict[str, str] = {}
 
+        # Task format cache: {task_dir -> (TsvFormat, run_id_columns)}
+        # All files in a task directory share the same format
+        self._task_format_cache: Dict[Path, Tuple[TsvFormat, List[int]]] = {}
+
+        # Email policy cache: {(task, field_path) -> EmailAction}
+        # Stores decisions for "redact_all" per task+field combination
+        self._email_policy_cache: Dict[Tuple[str, str], EmailAction] = {}
+        # Track one example per (task, field) for display
+        self._email_examples: Dict[Tuple[str, str], Tuple[str, str]] = {}  # -> (email, file_path)
+
         # Initialize stores
         self.mapping = MappingStore(config.mapping_db)
         self.repairs = RepairStore(config.mapping_db)
         self.errors = ErrorCollector()
 
-        # Initialize transformers
+        # Initialize transformers with email handler callback
         self.report_transformer = ReportTransformer(
             self.mapping,
             self.repairs,
             self.errors,
             interactive=config.interactive,
             ask_fn=self.ask_fn,
+            email_handler=self.get_email_action,
         )
         self.metadata_transformer = MetadataTransformer(
             self.mapping,
             self.errors,
+            email_handler=self.get_email_action,
         )
         self.tsv_transformer = TsvTransformer(
             self.mapping,
@@ -125,6 +137,7 @@ class AnonymizationPipeline:
         self,
         file_path: Path,
         hint: TsvFormatHint,
+        sample_lines: List[str] = None,
     ) -> Tuple[TsvFormat, List[int]]:
         """Ask user to confirm TSV format."""
         if not self.config.interactive:
@@ -132,6 +145,18 @@ class AnonymizationPipeline:
             return hint.likely_format, hint.run_id_columns
 
         print(f"\nDetected TSV format for {file_path.name}:")
+
+        # Show first data line as sample
+        if sample_lines:
+            for line in sample_lines:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    # Truncate if too long
+                    if len(line) > 80:
+                        line = line[:77] + "..."
+                    print(f"  Sample: {line}")
+                    break
+
         print(f"  Hint: {hint.likely_format.value} ({hint.confidence} confidence)")
         print(f"  Reason: {hint.reason}")
 
@@ -175,6 +200,76 @@ class AnonymizationPipeline:
             return [5]
         else:
             return []
+
+    def get_email_action(
+        self,
+        task: str,
+        field_path: str,
+        email: str,
+        file_path: Path,
+    ) -> EmailAction:
+        """Get action for an email address, prompting if needed.
+
+        Args:
+            task: Task directory name (e.g., "task1")
+            field_path: JSON path to the field (e.g., "metadata.creator.contact")
+            email: The email address found
+            file_path: File where email was found
+
+        Returns:
+            EmailAction indicating whether to redact or ignore
+        """
+        cache_key = (task, field_path)
+
+        # Check if we already have a policy for this task+field
+        if cache_key in self._email_policy_cache:
+            return self._email_policy_cache[cache_key]
+
+        # Store first example for this task+field
+        if cache_key not in self._email_examples:
+            self._email_examples[cache_key] = (email, str(file_path))
+
+        # Non-interactive mode: default to redact
+        if not self.config.interactive:
+            return EmailAction.REDACT
+
+        # Interactive: prompt user with example
+        example_email, example_file = self._email_examples[cache_key]
+        # Mask middle of email for display
+        masked = self._mask_email(example_email)
+
+        print(f"\nEmail found in {task}/ ({field_path}):")
+        print(f"  Example: {masked}")
+        print(f"  File: {example_file}")
+
+        options = [
+            ("Redact all (for this field in this task)", EmailAction.REDACT_ALL),
+            ("Redact this one", EmailAction.REDACT),
+            ("Ignore all (leave as-is for this field in this task)", EmailAction.IGNORE),
+        ]
+
+        choice = self.ask_fn("How should this email field be handled?", options)
+        action = options[choice][1]
+
+        # Cache "redact_all" and "ignore" decisions for this task+field
+        if action in (EmailAction.REDACT_ALL, EmailAction.IGNORE):
+            self._email_policy_cache[cache_key] = action
+
+        # For reporting purposes, map REDACT_ALL to REDACT
+        if action == EmailAction.REDACT_ALL:
+            return EmailAction.REDACT
+        return action
+
+    def _mask_email(self, email: str) -> str:
+        """Mask middle of email for display."""
+        if "@" not in email:
+            return email[:3] + "***"
+        local, domain = email.split("@", 1)
+        if len(local) <= 2:
+            masked_local = local[0] + "***"
+        else:
+            masked_local = local[:2] + "***"
+        return f"{masked_local}@{domain}"
 
     def _scan_metadata_for_priority(self, meta_dir: Path):
         """Scan metadata files to build priority map.
@@ -297,13 +392,38 @@ class AnonymizationPipeline:
 
         return self.stats
 
+    def _detect_file_format(self, file_path: Path) -> str:
+        """Detect if file is JSONL or TSV based on first line.
+
+        Returns: "jsonl" or "tsv"
+        """
+        import json
+        with open(file_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                try:
+                    json.loads(line)
+                    return "jsonl"
+                except json.JSONDecodeError:
+                    return "tsv"
+        return "jsonl"  # Empty file, default to jsonl
+
     def _process_runs(self, input_dir: Path, output_dir: Path):
-        """Process runs/ directory (Report JSONL files)."""
+        """Process runs/ directory (Report JSONL or TSV ranking files)."""
         print(f"\nProcessing runs: {input_dir}")
 
         for task_dir in input_dir.iterdir():
             if not task_dir.is_dir():
                 continue
+
+            # Set current task context for email handler
+            self.report_transformer._current_task = task_dir.name
+
+            # Track format for this task (all files in a task should be same format)
+            task_format = None
+            task_tsv_cols = None
 
             for run_file in task_dir.iterdir():
                 if run_file.is_dir():
@@ -316,20 +436,47 @@ class AnonymizationPipeline:
                     self.stats.files_filtered += 1
                     continue
 
-                # Determine output filename (anonymize after processing content)
                 rel_path = run_file.relative_to(input_dir)
 
                 if self.config.dry_run:
                     print(f"  [dry-run] Would process: {rel_path}")
                     continue
 
-                # Process content first to populate mappings
+                # Detect format on first file
+                if task_format is None:
+                    task_format = self._detect_file_format(run_file)
+                    if task_format == "tsv":
+                        # Detect TSV format and get run_id columns
+                        with open(run_file, "r") as f:
+                            sample_lines = f.readlines()[:20]
+                        hint = detect_tsv_format(sample_lines)
+                        fmt, task_tsv_cols = self._ask_tsv_format(
+                            run_file, hint, sample_lines
+                        )
+                        if fmt != TsvFormat.UNKNOWN:
+                            print(f"  (Detected {fmt.value} format for runs in {task_dir.name}/)")
+
+                # Process based on format
                 temp_output = output_dir / rel_path
-                lines = self.report_transformer.transform_file(run_file, temp_output)
+                if task_format == "jsonl":
+                    lines = self.report_transformer.transform_file(run_file, temp_output)
+                else:
+                    # TSV format (ranking file)
+                    if task_tsv_cols:
+                        lines = self.tsv_transformer.transform_file(
+                            run_file, temp_output, task_tsv_cols
+                        )
+                    else:
+                        # Unknown format, just copy
+                        temp_output.parent.mkdir(parents=True, exist_ok=True)
+                        import shutil
+                        shutil.copy2(run_file, temp_output)
+                        lines = sum(1 for _ in open(run_file))
+
                 self.stats.files_processed += 1
                 self.stats.lines_processed += lines
 
-                # Now rename output file with anonymized name
+                # Rename output file with anonymized name
                 anon_filename = anonymize_filename(run_file.name, self.mapping)
                 if anon_filename != run_file.name:
                     final_output = temp_output.parent / anon_filename
@@ -359,19 +506,29 @@ class AnonymizationPipeline:
 
                 rel_path = eval_file.relative_to(input_dir)
 
-                # Detect or lookup format
-                with open(eval_file, "r") as f:
-                    sample_lines = f.readlines()[:20]
-
-                hint = detect_tsv_format(sample_lines)
-
-                # Check for override
-                override_key = str(rel_path)
-                if override_key in self.config.tsv_formats:
-                    fmt = self.config.tsv_formats[override_key]
-                    run_id_cols = self._get_run_id_columns(fmt)
+                # Check if we have a cached format for this task directory
+                if task_dir in self._task_format_cache:
+                    fmt, run_id_cols = self._task_format_cache[task_dir]
                 else:
-                    fmt, run_id_cols = self._ask_tsv_format(eval_file, hint)
+                    # Detect format for first file in this task
+                    with open(eval_file, "r") as f:
+                        sample_lines = f.readlines()[:20]
+
+                    hint = detect_tsv_format(sample_lines)
+
+                    # Check for override
+                    override_key = str(rel_path)
+                    if override_key in self.config.tsv_formats:
+                        fmt = self.config.tsv_formats[override_key]
+                        run_id_cols = self._get_run_id_columns(fmt)
+                    else:
+                        fmt, run_id_cols = self._ask_tsv_format(eval_file, hint, sample_lines)
+
+                    # Cache format for this task directory (even if no run_id columns, like trec_eval)
+                    if fmt != TsvFormat.UNKNOWN:
+                        self._task_format_cache[task_dir] = (fmt, run_id_cols)
+                        if self.config.interactive:
+                            print(f"  (Using {fmt.value} format for all files in {task_dir.name}/)")
 
                 if fmt == TsvFormat.UNKNOWN or not run_id_cols:
                     print(f"  [skip] {rel_path} (no run_id columns)")
@@ -407,6 +564,9 @@ class AnonymizationPipeline:
         for task_dir in input_dir.iterdir():
             if not task_dir.is_dir():
                 continue
+
+            # Set current task context for email handler
+            self.metadata_transformer._current_task = task_dir.name
 
             for meta_file in task_dir.iterdir():
                 if meta_file.is_dir():

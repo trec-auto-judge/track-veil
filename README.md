@@ -10,15 +10,36 @@ uv pip install -e .
 
 ## Usage
 
+The input directory must **directly contain** `runs/`, `eval/`, and `metadata/` subdirectories:
+
+```
+{trackname}-export/     <-- point -i here
+├── runs/
+├── eval/
+└── metadata/
+```
+
 ```bash
-# Anonymize a dataset
-trec-anon anonymize -i data/raw -o data/anon -m mapping.db
+# Anonymize and export only priority 1 runs (primary use case)
+uv run trec-anon anonymize \
+  -i rag-export \
+  -o rag-anon \
+  -m mapping.db \
+  --priority "1 (top)"
 
 # Show mappings
-trec-anon show-mapping -m mapping.db
+uv run trec-anon show-mapping -m mapping.db
 
 # Reverse lookup
-trec-anon reverse-lookup -m mapping.db Fez-07
+uv run trec-anon reverse-lookup -m mapping.db Fez-07
+
+# Example with test data
+uv run trec-anon anonymize \
+  -i data/fake \
+  -o data/anon \
+  -m mapping.db \
+  --no-interactive \
+  --priority "1 (top)"
 ```
 
 
