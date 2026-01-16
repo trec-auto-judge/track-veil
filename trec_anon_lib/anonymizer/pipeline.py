@@ -244,6 +244,7 @@ class AnonymizationPipeline:
 
         options = [
             ("Redact all (for this field in this task)", EmailAction.REDACT_ALL),
+            ("Drop field (remove entire field for this task)", EmailAction.DROP_FIELD),
             ("Redact this one", EmailAction.REDACT),
             ("Ignore all (leave as-is for this field in this task)", EmailAction.IGNORE),
         ]
@@ -251,8 +252,8 @@ class AnonymizationPipeline:
         choice = self.ask_fn("How should this email field be handled?", options)
         action = options[choice][1]
 
-        # Cache "redact_all" and "ignore" decisions for this task+field
-        if action in (EmailAction.REDACT_ALL, EmailAction.IGNORE):
+        # Cache persistent decisions for this task+field
+        if action in (EmailAction.REDACT_ALL, EmailAction.DROP_FIELD, EmailAction.IGNORE):
             self._email_policy_cache[cache_key] = action
 
         # For reporting purposes, map REDACT_ALL to REDACT

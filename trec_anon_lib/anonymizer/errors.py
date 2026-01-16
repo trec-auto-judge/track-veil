@@ -25,9 +25,10 @@ class IssueType(str, Enum):
 
 class EmailAction(str, Enum):
     """Actions for handling email addresses."""
-    REDACT = "redact"       # Replace with [REDACTED]
-    IGNORE = "ignore"       # Leave as-is
-    REDACT_ALL = "redact_all"  # Redact all for this field+task
+    REDACT = "redact"           # Replace with [REDACTED]
+    IGNORE = "ignore"           # Leave as-is
+    REDACT_ALL = "redact_all"   # Redact all for this field+task
+    DROP_FIELD = "drop_field"   # Drop the entire field for this task
 
 
 @dataclass

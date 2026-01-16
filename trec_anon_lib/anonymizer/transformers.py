@@ -319,6 +319,10 @@ class ReportTransformer:
         if "metadata" in data:
             meta = data["metadata"]
 
+            # Always drop creator field (contains identifying info)
+            if "creator" in meta:
+                del meta["creator"]
+
             # Check narrative field type (common issue)
             if "narrative" in meta:
                 _, skip = self._check_field_type(
@@ -353,8 +357,8 @@ class ReportTransformer:
         line_num: int,
         parent: Any = None,
         parent_key: Any = None,
-    ):
-        """Recursively scan for email addresses and optionally redact.
+    ) -> bool:
+        """Recursively scan for email addresses and optionally redact/drop.
 
         Args:
             obj: The object to scan
@@ -363,13 +367,16 @@ class ReportTransformer:
             line_num: Line number for error reporting
             parent: Parent object (dict or list) for in-place modification
             parent_key: Key or index in parent for in-place modification
+
+        Returns:
+            True if this field should be dropped from parent
         """
         if isinstance(obj, str):
             emails = EMAIL_PATTERN.findall(obj)
             for email in emails:
                 self.errors.add_email_warning(file_path, line_num, path, email)
 
-                # Check with handler if we should redact
+                # Check with handler if we should redact/drop
                 if self.email_handler and parent is not None:
                     action = self.email_handler(
                         self._current_task, path, email, file_path
@@ -378,18 +385,35 @@ class ReportTransformer:
                         # Redact in place
                         redacted = EMAIL_PATTERN.sub("[REDACTED]", parent[parent_key])
                         parent[parent_key] = redacted
+                    elif action == EmailAction.DROP_FIELD:
+                        return True  # Signal to drop this field
+            return False
         elif isinstance(obj, dict):
+            keys_to_drop = []
             for key, value in obj.items():
-                self._scan_for_emails(
+                should_drop = self._scan_for_emails(
                     value, f"{path}.{key}", file_path, line_num,
                     parent=obj, parent_key=key
                 )
+                if should_drop:
+                    keys_to_drop.append(key)
+            for key in keys_to_drop:
+                del obj[key]
+            return False
         elif isinstance(obj, list):
+            indices_to_drop = []
             for i, item in enumerate(obj):
-                self._scan_for_emails(
+                should_drop = self._scan_for_emails(
                     item, f"{path}[{i}]", file_path, line_num,
                     parent=obj, parent_key=i
                 )
+                if should_drop:
+                    indices_to_drop.append(i)
+            # Remove in reverse order to preserve indices
+            for i in reversed(indices_to_drop):
+                del obj[i]
+            return False
+        return False
 
     def transform_file(
         self,
@@ -458,16 +482,17 @@ class MetadataTransformer:
             email = data["email"]
             self.errors.add_email_warning(file_path, line_num, "email", email)
 
-            # Check with handler if we should redact
-            should_redact = True  # Default to redact
+            # Check with handler for action
+            action = EmailAction.REDACT  # Default to redact
             if self.email_handler:
                 action = self.email_handler(
                     self._current_task, "email", email, file_path
                 )
-                should_redact = (action == EmailAction.REDACT)
 
-            if should_redact:
+            if action == EmailAction.REDACT:
                 data["email"] = "[REDACTED]"
+            elif action == EmailAction.DROP_FIELD:
+                del data["email"]
 
         return json.dumps(data, separators=(",", ":"))
 
