@@ -23,7 +23,6 @@ from .transformers import (
     TsvFormatHint,
     detect_tsv_format,
     anonymize_filename,
-    anonymize_eval_filename,
 )
 
 
@@ -90,6 +89,10 @@ class AnonymizationPipeline:
         # Task format cache: {task_dir -> (TsvFormat, run_id_columns)}
         # All files in a task directory share the same format
         self._task_format_cache: Dict[Path, Tuple[TsvFormat, List[int]]] = {}
+
+        # Eval filename pattern cache: {task_dir -> judge_suffix}
+        # e.g., ".qrel_eval", ".nist-edit", or None if filenames don't follow {run_id}.{judge}
+        self._eval_filename_cache: Dict[Path, Optional[str]] = {}
 
         # Email policy cache: {(task, field_path) -> EmailAction}
         # Stores decisions for "redact_all" per task+field combination
@@ -201,10 +204,151 @@ class AnonymizationPipeline:
             return [0]
         elif fmt == TsvFormat.RANKING:
             return [5]
-        elif fmt == TsvFormat.QRELS:
-            return [5]
         else:
             return []
+
+    def _ask_eval_filename_pattern(
+        self,
+        task_dir: Path,
+        sample_file: Path,
+    ) -> Optional[str]:
+        """Ask user about eval filename pattern for this task.
+
+        Returns:
+            - Judge suffix string (e.g., ".qrel_eval") for pattern-based extraction
+            - "MANUAL" marker to indicate run_id should be entered per file
+            - "SKIP" marker to skip the entire task
+        """
+        if not self.config.interactive:
+            # Non-interactive: try to detect common patterns
+            return self._detect_judge_suffix(sample_file.name)
+
+        print(f"\nEval filename pattern:")
+        print(f"  Task: {task_dir.name}")
+        print(f"  File: {sample_file}")
+        print(f"  Example filename: {sample_file.name}")
+        print(f"\nEval files typically follow the pattern: {{run_id}}.{{judge}}")
+        print(f"The run_id may contain dots, so we need to know the judge suffix.")
+
+        # Try to detect and suggest
+        detected = self._detect_judge_suffix(sample_file.name)
+        if detected:
+            print(f"  Detected suffix: '{detected}'")
+
+        options = [
+            ("Enter judge suffix (e.g., .qrel_eval, .nist-edit)", "enter_suffix"),
+            ("Enter run_id manually for each file", "manual"),
+            ("Skip this task", "skip"),
+        ]
+
+        choice = self.ask_fn("How should filenames be parsed?", options)
+        action = options[choice][1]
+
+        if action == "skip":
+            return "SKIP"
+        elif action == "manual":
+            return "MANUAL"
+        elif action == "enter_suffix":
+            suffix = input(f"Enter judge suffix (including dot, e.g., '.qrel_eval'): ").strip()
+            # Empty suffix is valid - means filename is exactly the run_id
+            if suffix and not suffix.startswith("."):
+                suffix = "." + suffix
+            return suffix
+
+        return "SKIP"
+
+    def _ask_manual_run_id(self, filename: str) -> Optional[str]:
+        """Ask user to enter run_id for a specific file.
+
+        Returns run_id or None to skip the file.
+        """
+        print(f"\nEnter run_id for file: {filename}")
+        print(f"  (or press Enter to skip this file)")
+        run_id = input("run_id: ").strip()
+        return run_id if run_id else None
+
+    def _get_filename_suffix(self, filename: str, run_id: str) -> str:
+        """Get the suffix part of a filename by removing the run_id prefix.
+
+        E.g., filename='team1-run1.judge', run_id='team1-run1' -> '.judge'
+        """
+        if filename.startswith(run_id):
+            return filename[len(run_id):]
+        return ""
+
+    def _copy_trec_eval_with_anon_runid(
+        self, input_file: Path, output_file: Path, anon_run_id: str
+    ) -> int:
+        """Copy trec_eval format file, replacing 'runid' metric values with anonymized run_id.
+
+        trec_eval format: topic_id<TAB>metric<TAB>value
+        The 'runid' metric line has the run_id as the value (3rd column).
+
+        Returns number of lines processed.
+        """
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        lines_processed = 0
+
+        with open(input_file, "r") as f_in, open(output_file, "w") as f_out:
+            for line in f_in:
+                lines_processed += 1
+                stripped = line.rstrip("\n\r")
+                if not stripped:
+                    f_out.write(line)
+                    continue
+
+                parts = stripped.split()  # Handle both tabs and spaces
+                # Check for runid metric in either column 0 or column 1
+                # Format can be: "runid all value" or "all runid value"
+                if len(parts) >= 3:
+                    if parts[0].lower() == "runid":
+                        parts[2] = anon_run_id
+                        f_out.write("\t".join(parts) + "\n")
+                    elif parts[1].lower() == "runid":
+                        parts[2] = anon_run_id
+                        f_out.write("\t".join(parts) + "\n")
+                    else:
+                        f_out.write(line)
+                else:
+                    f_out.write(line)
+
+        return lines_processed
+
+    def _detect_judge_suffix(self, filename: str) -> Optional[str]:
+        """Try to detect judge suffix from filename.
+
+        Common patterns: .qrel_eval, .nist-edit, .judge, .eval
+        """
+        # Check for common suffixes
+        common_suffixes = [".qrel_eval", ".nist-edit", ".nist_edit", ".judge", ".eval"]
+        for suffix in common_suffixes:
+            if filename.endswith(suffix):
+                return suffix
+        return None
+
+    def _extract_run_id_from_eval_filename(
+        self,
+        filename: str,
+        judge_suffix: Optional[str],
+    ) -> Optional[str]:
+        """Extract run_id from eval filename using known judge suffix.
+
+        Args:
+            filename: The eval filename (e.g., "aa.bb.cc.qrel_eval")
+            judge_suffix: The judge suffix (e.g., ".qrel_eval") or None
+
+        Returns:
+            The run_id (e.g., "aa.bb.cc") or None if can't extract
+        """
+        if judge_suffix is None:
+            return None
+
+        if not filename.endswith(judge_suffix):
+            return None
+
+        # Remove suffix to get run_id
+        run_id = filename[:-len(judge_suffix)]
+        return run_id if run_id else None
 
     def get_email_action(
         self,
@@ -368,20 +512,20 @@ class AnonymizationPipeline:
             else:
                 print(f"\nWarning: Priority filter set but no metadata directory found")
 
-        # Process runs directory
+        # Process runs directory first (establishes run_id mappings)
         runs_input = input_dir / self.config.runs_dir
         if runs_input.exists():
             self._process_runs(runs_input, output_dir / self.config.runs_dir)
 
-        # Process eval directory
-        eval_input = input_dir / self.config.eval_dir
-        if eval_input.exists():
-            self._process_eval(eval_input, output_dir / self.config.eval_dir)
-
-        # Process metadata directory
+        # Process metadata directory second (can provide team_id for runs)
         meta_input = input_dir / self.config.metadata_dir
         if meta_input.exists():
             self._process_metadata(meta_input, output_dir / self.config.metadata_dir)
+
+        # Process eval directory last (strictly lookup - all mappings should exist)
+        eval_input = input_dir / self.config.eval_dir
+        if eval_input.exists():
+            self._process_eval(eval_input, output_dir / self.config.eval_dir)
 
         # Update stats
         mapping_stats = self.mapping.get_stats()
@@ -431,7 +575,6 @@ class AnonymizationPipeline:
         # Track format for this task (all files in a task should be same format)
         task_format = None
         task_tsv_cols = None
-        unrenamed_files: List[Path] = []
 
         for run_file in task_dir.iterdir():
             if run_file.is_dir():
@@ -464,15 +607,24 @@ class AnonymizationPipeline:
                     if fmt != TsvFormat.UNKNOWN:
                         print(f"  (Detected {fmt.value} format for runs in {task_dir.name}/)")
 
+            # FILENAME IS THE SOURCE OF TRUTH for run_id
+            # Create mapping from filename FIRST, before processing content
+            anon_filename = anonymize_filename(run_file.name, self.mapping)
+
             # Process based on format
             temp_output = output_dir / rel_path
             if task_format == "jsonl":
-                lines = self.report_transformer.transform_file(run_file, temp_output)
+                # For JSONL, filename IS the run_id - verify content matches
+                lines = self.report_transformer.transform_file(
+                    run_file, temp_output, expected_run_id=run_file.name
+                )
             else:
                 # TSV format (ranking file)
                 if task_tsv_cols:
-                    lines = self.tsv_transformer.transform_file(
-                        run_file, temp_output, task_tsv_cols
+                    # For runs/, filename is source of truth - replace content run_ids
+                    # with the anonymized run_id from the filename
+                    lines = self._copy_tsv_with_replaced_run_id(
+                        run_file, temp_output, task_tsv_cols, anon_filename
                     )
                 else:
                     # Unknown format, just copy
@@ -484,56 +636,13 @@ class AnonymizationPipeline:
             self.stats.lines_processed += lines
 
             # Rename output file with anonymized name
-            anon_filename = anonymize_filename(run_file.name, self.mapping)
             if anon_filename != run_file.name:
                 final_output = temp_output.parent / anon_filename
                 temp_output.rename(final_output)
                 print(f"  {rel_path} -> {rel_path.parent / anon_filename}")
             else:
-                # For JSONL files, unrenamed is unexpected (mapping should be created)
-                # For TSV files, unrenamed means filename didn't match any run_id
-                if task_format == "jsonl":
-                    print(f"  {rel_path}")
-                else:
-                    print(f"  [WARNING] {rel_path} - filename not anonymized!")
-                    unrenamed_files.append(run_file)
-
-        # Check for unrenamed files (only relevant for TSV run files)
-        if unrenamed_files and self.config.interactive:
-            self._handle_unrenamed_run_files(task_dir, input_dir, output_dir, unrenamed_files)
-
-    def _handle_unrenamed_run_files(
-        self,
-        task_dir: Path,
-        input_dir: Path,
-        output_dir: Path,
-        unrenamed_files: List[Path],
-    ):
-        """Handle run files that weren't renamed."""
-        print(f"\n{'='*60}")
-        print(f"WARNING: {len(unrenamed_files)} run file(s) in task '{task_dir.name}' were not anonymized!")
-        print(f"This may indicate:")
-        print(f"  - Filename doesn't match the run_id in the file content")
-        print(f"  - Wrong TSV format was selected")
-        print(f"\nAffected files:")
-        for f in unrenamed_files[:5]:
-            print(f"  - {f.name}")
-        if len(unrenamed_files) > 5:
-            print(f"  ... and {len(unrenamed_files) - 5} more")
-
-        options = [
-            ("Continue anyway", "continue"),
-            ("Delete output for this task and skip", "skip"),
-        ]
-
-        choice = self.ask_fn("How to proceed?", options)
-        action = options[choice][1]
-
-        if action == "skip":
-            task_output_dir = output_dir / task_dir.name
-            if task_output_dir.exists():
-                shutil.rmtree(task_output_dir)
-            print(f"  Skipped task '{task_dir.name}'")
+                # This shouldn't happen since we just created the mapping above
+                print(f"  {rel_path}")
 
     def _process_eval(self, input_dir: Path, output_dir: Path):
         """Process eval/ directory (TSV files)."""
@@ -545,14 +654,104 @@ class AnonymizationPipeline:
 
             self._process_eval_task(task_dir, input_dir, output_dir)
 
+    def _handle_unknown_eval_run_id_value(
+        self,
+        eval_file: Path,
+        rel_path: Path,
+        extracted_run_id: str,
+    ) -> Optional[str]:
+        """Handle eval file where extracted run_id wasn't found in mapping.
+
+        Returns anonymized run_id or None to skip.
+        """
+        print(f"\nRun_id '{extracted_run_id}' not found in mapping.")
+        print(f"This typically means:")
+        print(f"  - This run wasn't included in runs/ directory")
+        print(f"  - The judge suffix was incorrect (wrong run_id extracted)")
+
+        options = [
+            ("Skip this file", "skip"),
+            ("Create mapping for this run_id", "create"),
+            ("Skip entire task directory", "skip_task"),
+        ]
+
+        choice = self.ask_fn("How to proceed?", options)
+        action = options[choice][1]
+
+        if action == "skip":
+            return None
+        elif action == "skip_task":
+            raise StopIteration("skip_task")  # Signal to skip entire task
+        elif action == "create":
+            # Create mapping and return anonymized run_id
+            anon_run = self.mapping.get_or_create_run(extracted_run_id)
+            print(f"  Created mapping: {extracted_run_id} -> {anon_run}")
+            return anon_run
+
+        return None
+
+    def _copy_tsv_with_replaced_run_id(
+        self,
+        input_path: Path,
+        output_path: Path,
+        run_id_cols: List[int],
+        replacement_run_id: str,
+    ) -> int:
+        """Copy TSV file, replacing all values in run_id columns with a single value.
+
+        Args:
+            input_path: Source TSV file
+            output_path: Destination file
+            run_id_cols: Which columns contain run_id values to replace
+            replacement_run_id: The value to use for all run_id columns
+
+        Returns:
+            Number of data lines processed
+        """
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        count = 0
+        with open(input_path, "r") as fin, open(output_path, "w") as fout:
+            for line in fin:
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    fout.write(line)
+                    continue
+                parts = stripped.split()
+
+                # Replace run_id in specified columns
+                for col_idx in run_id_cols:
+                    if col_idx < len(parts):
+                        parts[col_idx] = replacement_run_id
+
+                # Special case: trec_eval "runid" metric line
+                # Format: topic  metric  value  where metric="runid"
+                if len(parts) >= 3 and parts[1].lower() == "runid":
+                    parts[2] = replacement_run_id
+
+                fout.write("\t".join(parts) + "\n")
+                count += 1
+        return count
+
     def _process_eval_task(self, task_dir: Path, input_dir: Path, output_dir: Path):
         """Process a single task directory in eval/. May retry on user request."""
-        unrenamed_files: List[Path] = []
+        try:
+            self._process_eval_task_inner(task_dir, input_dir, output_dir)
+        except StopIteration as e:
+            if str(e) == "skip_task":
+                # User requested to skip entire task
+                task_output_dir = output_dir / task_dir.name
+                if task_output_dir.exists():
+                    shutil.rmtree(task_output_dir)
+                print(f"  Skipped task '{task_dir.name}'")
 
-        for eval_file in task_dir.iterdir():
-            if eval_file.is_dir():
-                continue
+    def _process_eval_task_inner(self, task_dir: Path, input_dir: Path, output_dir: Path):
+        """Inner implementation of eval task processing."""
+        # Get list of files first to allow asking about patterns on first file
+        eval_files = [f for f in task_dir.iterdir() if not f.is_dir()]
+        if not eval_files:
+            return
 
+        for eval_file in eval_files:
             # Check priority filter
             if not self._should_include_file(eval_file.name):
                 rel_path = eval_file.relative_to(input_dir)
@@ -594,95 +793,132 @@ class AnonymizationPipeline:
                 print(f"  [dry-run] Would process: {rel_path} as {fmt.value}")
                 continue
 
+            # Get filename pattern (judge suffix) for this task - ask once per task
+            if task_dir not in self._eval_filename_cache:
+                judge_suffix = self._ask_eval_filename_pattern(task_dir, eval_file)
+                self._eval_filename_cache[task_dir] = judge_suffix
+
+                # Handle SKIP - skip the entire task
+                if judge_suffix == "SKIP":
+                    print(f"  Skipping task '{task_dir.name}'")
+                    return
+
+                if judge_suffix and judge_suffix != "MANUAL" and self.config.interactive:
+                    print(f"  (Using filename pattern '{{run_id}}{judge_suffix}' for {task_dir.name}/)")
+            else:
+                judge_suffix = self._eval_filename_cache[task_dir]
+                # Already cached SKIP - return
+                if judge_suffix == "SKIP":
+                    return
+
+            # Extract run_id from filename
+            if judge_suffix == "MANUAL":
+                # Ask user for run_id per file
+                extracted_run_id = self._ask_manual_run_id(eval_file.name)
+                if extracted_run_id is None:
+                    print(f"  [skip] {rel_path} (no run_id provided)")
+                    continue
+            else:
+                # Use judge suffix pattern
+                extracted_run_id = self._extract_run_id_from_eval_filename(eval_file.name, judge_suffix)
+
             # For known formats without run_id columns (like trec_eval),
             # copy the file but still anonymize the filename
             if not run_id_cols:
-                temp_output = output_dir / rel_path
-                temp_output.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(eval_file, temp_output)
-                self.stats.files_processed += 1
+                if extracted_run_id is None:
+                    print(f"  [skip] {rel_path} (can't extract run_id from filename)")
+                    continue
 
-                # Eval filename format: {run_id}.{judge}
-                anon_filename = anonymize_eval_filename(eval_file.name, self.mapping)
-                if anon_filename != eval_file.name:
-                    final_output = temp_output.parent / anon_filename
-                    temp_output.rename(final_output)
-                    print(f"  {rel_path} -> {rel_path.parent / anon_filename} (content unchanged)")
+                # Look up run_id in mapping
+                anon_run = self.mapping.get_run(extracted_run_id)
+                if anon_run is None:
+                    print(f"  [WARNING] {rel_path}: run_id '{extracted_run_id}' not found in mapping")
+                    if self.config.interactive:
+                        anon_run = self._handle_unknown_eval_run_id_value(
+                            eval_file, rel_path, extracted_run_id
+                        )
+                    if anon_run is None:
+                        print(f"  [skip] {rel_path} (unknown run_id)")
+                        continue
+
+                temp_output = output_dir / rel_path
+
+                # Copy file, replacing 'runid' metric values with anonymized run_id
+                lines = self._copy_trec_eval_with_anon_runid(eval_file, temp_output, anon_run)
+                self.stats.files_processed += 1
+                self.stats.lines_processed += lines
+
+                # Construct anonymized filename
+                if judge_suffix == "MANUAL":
+                    # Derive suffix from original filename and manual run_id
+                    file_suffix = self._get_filename_suffix(eval_file.name, extracted_run_id)
                 else:
-                    print(f"  [WARNING] {rel_path} - filename not anonymized!")
-                    unrenamed_files.append(eval_file)
+                    file_suffix = judge_suffix
+                anon_filename = anon_run + file_suffix
+                final_output = temp_output.parent / anon_filename
+                temp_output.rename(final_output)
+                print(f"  {rel_path} -> {rel_path.parent / anon_filename}")
                 continue
 
             # Process content (anonymize run_id columns)
             temp_output = output_dir / rel_path
-            lines = self.tsv_transformer.transform_file(
-                eval_file, temp_output, run_id_cols
+
+            # For eval files: ALWAYS replace run_id columns with filename's anonymized run_id
+            # (filename is the source of truth, ignore whatever values are in the content)
+            if extracted_run_id and run_id_cols:
+                anon_run = self.mapping.get_run(extracted_run_id)
+                if anon_run:
+                    lines = self._copy_tsv_with_replaced_run_id(
+                        eval_file, temp_output, run_id_cols, anon_run
+                    )
+                    self.stats.files_processed += 1
+                    self.stats.lines_processed += lines
+
+                    # Anonymize filename
+                    if judge_suffix:
+                        if judge_suffix == "MANUAL":
+                            file_suffix = self._get_filename_suffix(eval_file.name, extracted_run_id)
+                        else:
+                            file_suffix = judge_suffix
+                        anon_filename = anon_run + file_suffix
+                        final_output = temp_output.parent / anon_filename
+                        temp_output.rename(final_output)
+                        print(f"  {rel_path} -> {rel_path.parent / anon_filename}")
+                    else:
+                        print(f"  {rel_path}")
+                    continue
+                else:
+                    print(f"  [ERROR] Filename run_id '{extracted_run_id}' not in mapping")
+                    continue
+
+            # Fallback: no extracted_run_id or no run_id_cols - try to anonymize using content values
+            lines, unknown_run_ids = self.tsv_transformer.transform_file(
+                eval_file, temp_output, run_id_cols,
+                create_if_missing=False,
             )
+
+            if unknown_run_ids:
+                print(f"  [WARNING] Unknown run_id(s) in content: {unknown_run_ids[:3]}")
+
             self.stats.files_processed += 1
             self.stats.lines_processed += lines
 
-            # Rename output file (eval format: {run_id}.{judge})
-            anon_filename = anonymize_eval_filename(eval_file.name, self.mapping)
-            if anon_filename != eval_file.name:
-                final_output = temp_output.parent / anon_filename
-                temp_output.rename(final_output)
-                print(f"  {rel_path} -> {rel_path.parent / anon_filename}")
+            # Try to anonymize filename if we have a pattern
+            if extracted_run_id is not None and judge_suffix is not None:
+                anon_run = self.mapping.get_run(extracted_run_id)
+                if anon_run is not None:
+                    if judge_suffix == "MANUAL":
+                        file_suffix = self._get_filename_suffix(eval_file.name, extracted_run_id)
+                    else:
+                        file_suffix = judge_suffix
+                    anon_filename = anon_run + file_suffix
+                    final_output = temp_output.parent / anon_filename
+                    temp_output.rename(final_output)
+                    print(f"  {rel_path} -> {rel_path.parent / anon_filename}")
+                else:
+                    print(f"  {rel_path} (filename run_id '{extracted_run_id}' not in mapping)")
             else:
-                print(f"  [WARNING] {rel_path} - filename not anonymized!")
-                unrenamed_files.append(eval_file)
-
-        # Check for unrenamed files and offer retry
-        if unrenamed_files and self.config.interactive:
-            self._handle_unrenamed_files(task_dir, input_dir, output_dir, unrenamed_files)
-
-    def _handle_unrenamed_files(
-        self,
-        task_dir: Path,
-        input_dir: Path,
-        output_dir: Path,
-        unrenamed_files: List[Path],
-    ):
-        """Handle files that weren't renamed - warn user and offer retry."""
-        print(f"\n{'='*60}")
-        print(f"WARNING: {len(unrenamed_files)} file(s) in task '{task_dir.name}' were not anonymized!")
-        print(f"This may indicate:")
-        print(f"  - Wrong TSV format was selected")
-        print(f"  - Input filenames don't match expected {{run_id}}.{{judge}} pattern")
-        print(f"  - Run files weren't processed first (mappings not established)")
-        print(f"\nAffected files:")
-        for f in unrenamed_files[:5]:  # Show first 5
-            print(f"  - {f.name}")
-        if len(unrenamed_files) > 5:
-            print(f"  ... and {len(unrenamed_files) - 5} more")
-
-        options = [
-            ("Continue anyway (files copied but not anonymized)", "continue"),
-            ("Retry this task with different format selection", "retry"),
-            ("Delete output for this task and skip", "skip"),
-        ]
-
-        choice = self.ask_fn("How to proceed?", options)
-        action = options[choice][1]
-
-        if action == "retry":
-            # Clear cache and output for this task
-            if task_dir in self._task_format_cache:
-                del self._task_format_cache[task_dir]
-
-            # Remove output directory for this task
-            task_output_dir = output_dir / task_dir.name
-            if task_output_dir.exists():
-                shutil.rmtree(task_output_dir)
-
-            print(f"\nRetrying task '{task_dir.name}'...")
-            self._process_eval_task(task_dir, input_dir, output_dir)
-
-        elif action == "skip":
-            # Remove output directory for this task
-            task_output_dir = output_dir / task_dir.name
-            if task_output_dir.exists():
-                shutil.rmtree(task_output_dir)
-            print(f"  Skipped task '{task_dir.name}'")
+                print(f"  {rel_path}")
 
     def _process_metadata(self, input_dir: Path, output_dir: Path):
         """Process metadata/ directory (Metadata JSONL files)."""

@@ -35,7 +35,6 @@ class TsvFormat(str, Enum):
     IR_MEASURES = "ir_measures"  # {run_id} {topic} {measure} {value}
     TREC_EVAL = "trec_eval"      # {topic} {measure} {value}
     RANKING = "ranking"          # {topic} Q0 {doc_id} {rank} {score} {run_id}
-    QRELS = "qrels"              # {topic} Q0 {doc_id} {grade} {is_relevant} {run_id}
     UNKNOWN = "unknown"
 
 
@@ -183,29 +182,17 @@ def detect_tsv_format(lines: List[str]) -> TsvFormatHint:
                 [0],
             )
 
-    # 6 columns: ranking or qrels (both have run_id in col 5)
+    # 6 columns: ranking format {topic} Q0 {doc_id} {rank} {score} {run_id}
     if typical_cols == 6:
         first_row = sample_rows[0]
         # Check if col 1 is "Q0" (common in TREC formats)
         if len(first_row) > 1 and first_row[1] == "Q0":
-            # Both ranking and qrels have Q0 in col 1
-            # ranking: {topic} Q0 {doc_id} {rank} {score} {run_id}
-            # qrels: {topic} Q0 {doc_id} {grade} {is_relevant} {run_id}
-            # Difference: col 4 is float (score) vs int (is_relevant 0/1)
-            if looks_like_float(first_row[4]) and not looks_like_topic(first_row[4]):
-                return TsvFormatHint(
-                    TsvFormat.RANKING,
-                    "medium",
-                    "6 columns with Q0, col 4 looks like score: ranking format",
-                    [5],
-                )
-            else:
-                return TsvFormatHint(
-                    TsvFormat.QRELS,
-                    "medium",
-                    "6 columns with Q0: qrels format",
-                    [5],
-                )
+            return TsvFormatHint(
+                TsvFormat.RANKING,
+                "medium",
+                "6 columns with Q0: ranking format",
+                [5],
+            )
         return TsvFormatHint(
             TsvFormat.UNKNOWN,
             "low",
@@ -240,6 +227,7 @@ class ReportTransformer:
         self.ask_fn = ask_fn or self._default_ask
         self.email_handler = email_handler
         self._current_task: str = ""  # Set by caller before processing
+        self._warned_run_mismatches: set = set()  # Track warned mismatches to avoid repeats
 
     def _default_ask(self, prompt: str, options: List[Tuple[str, Any]]) -> int:
         """Default interactive prompt."""
@@ -333,8 +321,15 @@ class ReportTransformer:
         line: str,
         file_path: Path,
         line_num: int,
+        expected_run_id: Optional[str] = None,
     ) -> Tuple[Optional[str], Optional[Dict[str, str]]]:
         """Transform a single JSONL line.
+
+        Args:
+            line: The JSONL line to transform
+            file_path: Source file for error reporting
+            line_num: Line number for error reporting
+            expected_run_id: If provided, verify metadata.run_id matches this value
 
         Returns (transformed_json, fingerprint_info) where fingerprint_info
         is a dict with keys: fingerprint, original_team, original_run,
@@ -381,7 +376,21 @@ class ReportTransformer:
 
             # Capture original values BEFORE anonymization for fingerprinting
             original_team = current_team
-            original_run = meta.get("run_id", "")
+            content_run_id = meta.get("run_id", "")
+
+            # Filename is the source of truth for run_id
+            # If expected_run_id (filename) is provided, use it instead of content's run_id
+            if expected_run_id:
+                if content_run_id and content_run_id != expected_run_id:
+                    # Only warn once per (file, content_run_id, expected_run_id) combination
+                    warn_key = (file_path.name, content_run_id, expected_run_id)
+                    if warn_key not in self._warned_run_mismatches:
+                        self._warned_run_mismatches.add(warn_key)
+                        print(f"  [WARNING] {file_path.name}: metadata.run_id '{content_run_id}' "
+                              f"doesn't match filename '{expected_run_id}' - using filename")
+                original_run = expected_run_id
+            else:
+                original_run = content_run_id
 
             # Parse into Report model to get correctly resolved topic_id and text
             try:
@@ -399,9 +408,9 @@ class ReportTransformer:
                 anon_team = self.mapping.get_or_create_team(original_team)
                 meta["team_id"] = anon_team
 
-            # Anonymize run_id
+            # Anonymize run_id (use original_run which is authoritative - from filename if provided)
             anon_run = ""
-            if "run_id" in meta and meta["run_id"]:
+            if original_run:
                 anon_run = self.mapping.get_or_create_run(original_run)
                 meta["run_id"] = anon_run
 
@@ -492,8 +501,15 @@ class ReportTransformer:
         self,
         input_path: Path,
         output_path: Path,
+        expected_run_id: Optional[str] = None,
     ) -> int:
-        """Transform a Report JSONL file. Returns number of lines processed."""
+        """Transform a Report JSONL file. Returns number of lines processed.
+
+        Args:
+            input_path: Source JSONL file
+            output_path: Destination file
+            expected_run_id: If provided, verify metadata.run_id matches (typically the filename)
+        """
         output_path.parent.mkdir(parents=True, exist_ok=True)
         count = 0
         with open(input_path, "r") as fin, open(output_path, "w") as fout:
@@ -501,7 +517,9 @@ class ReportTransformer:
                 line = line.strip()
                 if not line:
                     continue
-                result, fingerprint_info = self.transform_line(line, input_path, line_num)
+                result, fingerprint_info = self.transform_line(
+                    line, input_path, line_num, expected_run_id
+                )
                 if result:
                     fout.write(result + "\n")
                     count += 1
@@ -524,6 +542,7 @@ class MetadataTransformer:
         self.errors = errors
         self.email_handler = email_handler
         self._current_task: str = ""  # Set by caller before processing
+        self._warned_runs: set = set()  # Track which runs we've warned about
 
     def transform_line(
         self,
@@ -545,13 +564,19 @@ class MetadataTransformer:
             )
             return None
 
-        # Anonymize org (team)
+        # Anonymize org (team) - teams are expected to come from metadata
         if "org" in data and data["org"]:
             data["org"] = self.mapping.get_or_create_team(data["org"])
 
         # Anonymize runtag (run_id)
+        # Warn if creating new mapping - run_id should normally come from runs/
         if "runtag" in data and data["runtag"]:
-            data["runtag"] = self.mapping.get_or_create_run(data["runtag"])
+            original_run = data["runtag"]
+            existing = self.mapping.get_run(original_run)
+            if existing is None and original_run not in self._warned_runs:
+                print(f"  [WARNING] Creating run mapping from metadata (not seen in runs/): {original_run}")
+                self._warned_runs.add(original_run)
+            data["runtag"] = self.mapping.get_or_create_run(original_run)
 
         # Check for email field
         if "email" in data and data["email"]:
@@ -593,7 +618,7 @@ class MetadataTransformer:
 
 
 class TsvTransformer:
-    """Transform TSV/WSV files (eval/)."""
+    """Transform TSV/WSV files (eval/ and runs/)."""
 
     def __init__(
         self,
@@ -608,14 +633,28 @@ class TsvTransformer:
         input_path: Path,
         output_path: Path,
         run_id_columns: List[int],
-    ) -> int:
-        """Transform a TSV file, anonymizing run_id in specified columns."""
+        create_if_missing: bool = False,
+    ) -> Tuple[int, List[str]]:
+        """Transform a TSV file, anonymizing run_id in specified columns.
+
+        Args:
+            input_path: Source TSV file
+            output_path: Destination file
+            run_id_columns: Which columns contain run_id
+            create_if_missing: If True, create new mappings for unknown run_ids (for runs/).
+                             If False, track unknown run_ids and return them (for eval/).
+
+        Returns:
+            Tuple of (lines_processed, list_of_unknown_run_ids)
+        """
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         with open(input_path, "r") as fin:
             lines = fin.readlines()
 
         count = 0
+        unknown_run_ids: List[str] = []
+
         with open(output_path, "w") as fout:
             for line in lines:
                 stripped = line.strip()
@@ -627,26 +666,38 @@ class TsvTransformer:
                 for col_idx in run_id_columns:
                     if col_idx < len(parts):
                         original = parts[col_idx]
-                        parts[col_idx] = self._anonymize_value(original)
+                        anon, is_unknown = self._anonymize_value(original, create_if_missing)
+                        parts[col_idx] = anon
+                        if is_unknown and original not in unknown_run_ids:
+                            unknown_run_ids.append(original)
 
                 fout.write("\t".join(parts) + "\n")
                 count += 1
 
-        return count
+        return count, unknown_run_ids
 
-    def _anonymize_value(self, value: str) -> str:
+    def _anonymize_value(self, value: str, create_if_missing: bool) -> Tuple[str, bool]:
         """Anonymize a run_id value.
 
-        The value is treated as a run_id and looked up in the mapping.
+        Args:
+            value: The run_id value to anonymize
+            create_if_missing: If True, create mapping if not found
+
+        Returns:
+            Tuple of (anonymized_value, is_unknown).
+            If is_unknown is True, the value was not found and wasn't created.
         """
-        run_map = self.mapping.get_all_run_mappings()
-
         # Check if value matches a known run_id
-        if value in run_map:
-            return run_map[value]
+        existing = self.mapping.get_run(value)
+        if existing is not None:
+            return existing, False
 
-        # Not found - return as-is (or could create new mapping)
-        return value
+        # Not found
+        if create_if_missing:
+            return self.mapping.get_or_create_run(value), False
+        else:
+            # Return original value and flag as unknown
+            return value, True
 
 
 def anonymize_filename(
@@ -666,7 +717,7 @@ def anonymize_filename(
 def anonymize_eval_filename(
     filename: str,
     mapping: MappingStore,
-) -> str:
+) -> Optional[str]:
     """Anonymize eval filename with format {run_id}.{judge}.
 
     Eval files have format: {run_id}.{judge}
@@ -674,6 +725,8 @@ def anonymize_eval_filename(
     We match the longest known run_id that is a prefix of the filename.
 
     Example: "my.run.v1.nist-edit" -> "007.nist-edit" (if "my.run.v1" is known)
+
+    Returns None if no matching run_id is found (caller should handle this error).
     """
     run_map = mapping.get_all_run_mappings()
 
@@ -688,4 +741,4 @@ def anonymize_eval_filename(
             # Replace run_id prefix, keep the rest (.judge extension)
             return anon_run + filename[len(orig_run):]
 
-    return filename  # No match found
+    return None  # No match found - caller should handle this error
