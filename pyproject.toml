@@ -34,7 +34,7 @@ test = [
 ]
 
 [project.scripts]
-trec-auto-judge = "trec_anon:main"
+trec-anon = "trec_anon_lib.anonymizer.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/trec-auto-judge/trec_anon"

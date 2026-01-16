@@ -1,0 +1,3 @@
+{"runtag": "run1", "org": "team1", "email": "researcher@university.edu", "date": "2025-08-14", "task": "trec2025-rag-generation", "std-priority": "1 (top)"}
+{"runtag": "run2", "org": "team2", "email": "another@example.com", "date": "2025-08-15", "task": "trec2025-rag-generation", "std-priority": "2"}
+{"runtag": "run.v1", "org": "team.org", "email": "dotted@test.com", "date": "2025-08-16", "task": "trec2025-rag-generation", "std-priority": "1 (top)"}

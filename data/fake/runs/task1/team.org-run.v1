@@ -1,0 +1,1 @@
+{"metadata": {"team_id": "team.org", "run_id": "run.v1", "type": "automatic", "narrative_id": 995, "narrative": "Test with dots"}, "references": ["doc1"], "answer": [{"text": "Answer", "citations": ["doc1"]}]}

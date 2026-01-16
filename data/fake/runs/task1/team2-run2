@@ -1,0 +1,1 @@
+{"metadata": {"team_id": "team2", "run_id": "run2", "type": "manual", "narrative_id": 990, "narrative": "Test narrative for team2"}, "references": ["msmarco_v2.1_doc_00_000000001#1_1"], "answer": [{"text": "Test answer", "citations": ["msmarco_v2.1_doc_00_000000001#1_1"]}]}
