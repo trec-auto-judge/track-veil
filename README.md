@@ -64,7 +64,7 @@ The input directory must contain `runs/`, `eval/`, and `metadata/` subdirectorie
 ├── eval/{task}/
 │   └── {run_id}.{judge}               # Evaluation output
 └── metadata/{task}/
-    └── trec2025-{trackname}-{task}.jl # Evalbase metadata
+    └── *.jl                           # Evalbase metadata (any filename)
 ```
 
 Each directory contains `{task}/` subfolders matching the track's tasks (e.g., RAG: `retrieval`, `generation`; RAGTIME: `mlir`, `repgen`).
@@ -112,12 +112,14 @@ runid                 all     {run_id}
 ```
 
 
-**Evalbase**
+**Evalbase Metadata**
 
-`metadata/{task}/trec2025-{trackname}-{task}.jl`:
+`metadata/{task}/*.jl` — any JSONL file:
 ```json
 {"runtag": "{run_id}", "org": "{team}", "std-priority": "{priority}", ...}
 ```
+
+Whenever team names are inconsistent, we will prefer information from `runs` directory. The metadata team name will get a separate anonymization name. Use `run_id` as unique identifier that is consistent between both.
 
 ### Processing order
 
