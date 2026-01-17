@@ -1,12 +1,17 @@
 # Track Veil
 
-Anonymize team and run identifiers in track datasets for sharing. 
+Anonymize team and run identifiers in track datasets for sharing.
 
-Runs: Supports rankings in trec-run format and `Report` format of TREC RAG, RAGTIME, DRAGUN, etc.
-Eval: Supports evaluation output from `trec_eval`, `ir_measures`, `tot` (TREC Tip of the Tounge)
-Metadata: Evalbase metadata
+**Supported formats:**
+- **Runs**: Rankings in trec-eval `run` format and `Report` JSONL (TREC RAG, RAGTIME, DRAGUN, etc.)
+- **Eval**: Output from `trec_eval`, `ir_measures`, `tot` (TREC Tip of the Tongue)
+- **Metadata**: Evalbase upload metadata
 
-Run track_
+**Anonymization scheme** (stored in SQLite):
+| Original | Anonymized | Example |
+|----------|------------|---------|
+| team | "T" + 3-digit number | `T042`, `T911` |
+| run_id | plantimal name | `koala`, `oak` |
 
 ## Installation
 
@@ -14,172 +19,206 @@ Run track_
 uv pip install -e .
 ```
 
-## Usage
-
-The input directory must **directly contain** `runs/`, `eval/`, and `metadata/` subdirectories:
-
-```
-{trackname}-export/     <-- point -i here
-├── runs/
-├── eval/
-└── metadata/
-```
+## Quick Start
 
 ```bash
-# Anonymize and export only priority 1 runs (primary use case)
+# Anonymize priority 1 runs (primary use case)
 uv run track-veil anonymize \
   -i track-export \
   -o track-anon \
   -m mapping.db \
   --priority "1 (top)"
 
-# Show mappings
+# View mappings
 uv run track-veil show-mapping -m mapping.db
 
 # Reverse lookup
-uv run track-veil reverse-lookup -m mapping.db T042-bear
+uv run track-veil reverse-lookup -m mapping.db T042-koala
+```
 
-# Recover mappings from anonymized reports (if mapping.db is lost)
-uv run track-veil recover-mapping -m mapping.db -i anon_data/runs/
+Run in interactive mode — the tool will ask for format clarifications and how to handle data errors.
 
-# Example with test data
-uv run track-veil anonymize \
-  -i data/fake \
-  -o data/anon \
-  -m mapping.db
+## Input Format
+
+### Variables
+
+Placeholders in `{curly braces}` represent:
+
+| Variable | Description | Examples |
+|----------|-------------|----------|
+| `{trackname}` | Name of the track | `rag`, `ragtime`, `dragun` |
+| `{task}` | Task within the track | `retrieval`, `generation`, `qrels` |
+| `{team}` | Team/organization name | `acme-corp`, `university.edu` |
+| `{run_id}` | Unique run identifier | `baseline-v1`, `my.run.2` |
+| `{judge}` | Judgment method | `trec_eval`, `autoargue` |
+| `{priority}` | Upload priority | `1 (top)`, `2`, `3` |
+
+### Directory structure
+
+The input directory must contain `runs/`, `eval/`, and `metadata/` subdirectories:
+
+```
+{trackname}-export/
+├── runs/{task}/
+│   └── {run_id}                       # JSONL report or TSV ranking
+├── eval/{task}/
+│   └── {run_id}.{judge}               # Evaluation output
+└── metadata/{task}/
+    └── trec2025-{trackname}-{task}.jl # Evalbase metadata
+```
+
+Each directory contains `{task}/` subfolders matching the track's tasks (e.g., RAG: `retrieval`, `generation`; RAGTIME: `mlir`, `repgen`).
+
+### File contents
+
+
+**Report JSONL**
+
+`runs/{task}/{run_id}` — Report JSONL (one object per line):
+```json
+{"metadata": {"team_id": "{team}", "run_id": "{run_id}", "topic_id": "1"}, "responses": [{"text": "..."}], ...}
+```
+
+**Trec_Eval Run**
+
+`runs/{task}/{run_id}` — TSV ranking (alternative format):
+```
+{topic}  Q0  {doc_id}  {rank}  {score}  {run_id}
+```
+
+**Trec_Eval Output**
+
+`eval/{task}/{run_id}.{judge}` — trec_eval format:
+```
+map                   all     0.2345
+ndcg                  all     0.4567
+runid                 all     {run_id}
+```
+
+**ir_measures Output**
+
+`eval/{task}/{run_id}.{judge}` — ir_measures format:
+```
+{run_id}  {topic}  nDCG@10  0.4567
+{run_id}  {topic}  AP       0.2345
+```
+
+**ToT Output**
+
+`eval/{task}/{run_id}.{judge}` — tot (Tip of the Tongue) format:
+```
+{run_id}  nDCG@10  {topic}  0.4567
+{run_id}  AP       {topic}  0.2345
 ```
 
 
+**Evalbase**
 
-Description of raw track datasets (e.g. from TREC), for cleaning and anonymization pipeline.
+`metadata/{task}/trec2025-{trackname}-{task}.jl`:
+```json
+{"runtag": "{run_id}", "org": "{team}", "std-priority": "{priority}", ...}
+```
 
-Below we specify the data layout and how to parse variables from the file name or content info. 
+### Processing order
 
+`runs/` → `metadata/` → `eval/`
 
----
+Mappings created from `runs/` are applied consistently across all directories.
 
-
-
-## Variables
-
-Each variable is denoted as `{variable}`
-
-**Note:** Variables `team`, `run_id`, and `judge` may contain dots (e.g., `team.org`, `run.v1`, `judge.method`). The filename format `{team}-{run}.{judge}` uses `-` to separate team from run, and the first `.` after the team-run identifier separates the judge extension.
-
-- trackname  # the name of the track, examples: "dragun" | "rag" | "ragtime"
-- task       # name of the task run by the track, examples: "rag":  "auggen" | "generation" | "qrels" | "retrieval"  or  "ragtime": "mlir" | "repgen" or "dragun": "qgen" | "repgen"
-- run_id     # unique run name submitted by a team (may contain dots)
-- team       # team that submitted multiple run_ids (may contain dots)
-- judge      # judgment method (may contain dots), examples:
-             # "rag": "nist-post-edit"   or
-             # "ragtime": "autoargue" or
-             # "dragun": "contradictory.results" | "supportive.results"
-- priority   # priority of the team and run upload. examples: "1 (top)" | "2" | "3"| ...
-
-
-## Directory layout
-
-Nested list denotes subdirectory structure. File are either jsonl or "white-space separated value" (TSV/WSV), relevant variables embedded in the contents are indicated in comments.
-
-- {trackname}-export   # export for each track
-  - runs                                #  submitted systems (aka runs)
-     - {task}                            # directory for each task
-       - {run_id}                        #  file for each run, format: "report" | "ranking"
-                                         #  "report":  jsonl file with  "{"metadata": {"team_id": "{team}", "run_id": "{run_id}", ...}, ...}"  (load with `report.py#load_report`)
-                                         #  "ranking": trec_eval run file: "{topic} Q0 {doc_id} {rank} {score} {run_id}"
-  - eval                                 #  per topic/team/run evaluation results
-     - {task}
-       - {run_id}.{judge}                 # leaderboard in either in format "tot" | "trec_eval" | "ir_measures" | else
-                                          # "ir_measures":  "{run_id} {topic} {measure} {value}"
-                                          # "trec_eval":    "{topic} {measure} {value}"
-                                          # "tot":          "{run_id} {measure} {topic} {value}"
-                                          
-  - metadata  # data from form upload
-     - {task}
-        - trec2025-{trackname}-{task}.jl   # json lines with meta information for each run from web upload form. format
-                                          # { "runtag": "{run_id}",  "org": "{team}", "std-priority": "{priority}", ...}
-
-    
-
-## Data Cleaning
-
-...todo... (We will do this later)
-
-
-## Anonymization
-
-The goal is to share runs and eval data while hiding team and run identifiers to preserve anonymity during evaluation.
-
-**Primary use case:** Anonymize and export only priority 1 runs for sharing with the research community.
+## How Anonymization Works
 
 ### What gets anonymized
 
-| Original | Anonymized | Format |
-|----------|------------|--------|
-| team     | "T" + 3-digit number | e.g., "T042", "T196", "T007" |
-| run_id   | plantimal name | e.g., "bear", "oak", "frog" |
-
-Anonymization is applied to:
-- **Filenames**: `team1-run1.judge` → `T042-bear.judge`
+- **Filenames**: `{run_id}.{judge}` → `koala.{judge}`
 - **JSONL content**: `team_id`, `run_id` fields in reports and metadata
-- **TSV content**: run_id columns (auto-detected or interactively confirmed)
-- **Email addresses**: Detected and handled interactively (redact, ignore, or drop field)
+- **TSV content**: `run_id` columns (auto-detected or interactively confirmed)
+- **Email addresses**: Detected and handled interactively
 
 ### Mapping persistence
 
-Mappings are stored in a SQLite database for:
+Mappings are stored in a SQLite database (`-m mapping.db`) for:
 - Consistency across multiple runs
 - Reverse lookup (de-anonymization if needed)
-- Reproducibility (same input always produces same output)
-
-### Priority filtering
-
-Runs can be filtered by priority using metadata's `std-priority` field. Only runs matching the specified priority are included in the output.
-
-### TSV format detection
-
-The tool auto-detects TSV file formats based on:
-- **Header rows**: Recognizes column names like `run_id`, `request_id`, `metric`, `value`
-- **Column count**: 3 columns = trec_eval, 4 columns = tot/ir_measures, 6 columns with Q0 = ranking
-- **Content patterns**: Numeric values indicate data rows, not headers
-
-In interactive mode, detected formats are confirmed with the user. Format decisions are cached per task directory.
+- Reproducibility (same input → same output)
 
 ### Filename as source of truth
 
-For both `runs/` and `eval/` files, the **filename is the source of truth** for the run_id. Even if the file content contains a different run_id value, it will be replaced with the anonymized run_id derived from the filename.
+For `runs/` and `eval/` files, the **filename determines the run_id**. Content values are replaced with the anonymized run_id derived from the filename, even if they differ.
 
-This ensures consistency when:
-- Content run_id values are incorrect or inconsistent
-- Multiple files need to be processed with the same mapping
+## CLI Commands
 
-### trec_eval format handling
-
-For trec_eval format files (3 columns: `{measure} {topic} {value}`), the special `runid` metric line is anonymized:
-
-```
-runid    all    original_run_name  →  runid    all    anonymized_run_id
-```
-
-Both tab-separated and space-separated files are supported.
-
-### Fingerprint-based mapping recovery
-
-During anonymization, content fingerprints (SHA256 of topic_id + report text) are stored in the mapping database. If the mapping.db is available but you need to verify mappings against anonymized data:
+### Anonymize
 
 ```bash
-# Recover/verify mappings from anonymized reports
+track-veil anonymize \
+  -i <input-dir> \
+  -o <output-dir> \
+  -m <mapping.db> \
+  [--priority "1 (top)"]
+```
+
+Run interactively to resolve ambiguities and anonymization options.
+
+### Show-mapping
+
+```bash
+track-veil show-mapping -m mapping.db
+```
+
+### Reverse-lookup
+
+```bash
+track-veil reverse-lookup -m mapping.db T042-koala
+```
+
+### Recover-mapping
+
+Recover original mappings from anonymized reports using stored fingerprints:
+
+```bash
 uv run track-veil recover-mapping -m mapping.db -i anon_data/runs/ -f table
 uv run track-veil recover-mapping -m mapping.db -i anon_data/runs/ -f csv -o recovered.csv
 ```
 
+## Advanced
+
+### Priority filtering
+
+Filter runs by metadata's `std-priority` field. Only matching runs are included in output.
+
+```bash
+--priority "1 (top)"
+```
+
+### TSV format detection
+
+The tool auto-detects TSV formats based on:
+- **Header rows**: Recognizes `run_id`, `request_id`, `metric`, `value`
+- **Column count**: 3 = trec_eval, 4 = tot/ir_measures, 6 with Q0 = ranking
+- **Content patterns**: Numeric values indicate data rows, not headers
+
+In interactive mode, detected formats are confirmed with the user and cached per task.
+
+### trec_eval runid handling
+
+For trec_eval format (3 columns: `{measure} {topic} {value}`), the `runid` metric line is anonymized:
+
+```
+runid    all    {original}  →  runid    all    {anonymized}
+```
+
+Both tab-separated and space-separated files are supported.
+
 ### Email handling
 
-Email addresses found in data trigger interactive prompts with options:
+Email addresses trigger interactive prompts:
 - **Redact**: Replace with `[REDACTED]`
 - **Ignore**: Leave as-is
 - **Redact all**: Redact all emails in this field for the current task
-- **Drop field**: Remove the entire field containing the email
+- **Drop field**: Remove the entire field
 
 Decisions are cached per (task, field) combination.
 
+### Fingerprint-based recovery
+
+During anonymization, content fingerprints (SHA256 of topic_id + report text) are stored. Use `recover-mapping` to match anonymized reports back to original identifiers.

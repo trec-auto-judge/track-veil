@@ -57,11 +57,6 @@ def cli():
     help="Name of metadata subdirectory (default: metadata)",
 )
 @click.option(
-    "--no-interactive",
-    is_flag=True,
-    help="Run non-interactively (skip prompts, log errors)",
-)
-@click.option(
     "--dry-run",
     is_flag=True,
     help="Show what would be done without making changes",
@@ -85,7 +80,6 @@ def anonymize(
     runs_dir: str,
     eval_dir: str,
     metadata_dir: str,
-    no_interactive: bool,
     dry_run: bool,
     error_report: Optional[Path],
     priority_filter: Optional[str],
@@ -106,7 +100,6 @@ def anonymize(
         runs_dir=runs_dir,
         eval_dir=eval_dir,
         metadata_dir=metadata_dir,
-        interactive=not no_interactive,
         dry_run=dry_run,
         priority_filter=priority_filter,
     )
