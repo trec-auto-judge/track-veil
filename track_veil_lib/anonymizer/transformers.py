@@ -293,7 +293,7 @@ class ReportTransformer:
             desc, rule = options[choice]
 
             # Ask if should remember
-            remember = input("Remember this fix? [Y]es for all, [t]his team only, [n]o: ").strip().lower()
+            remember = input("Remember this fix? [Y]es for all, [t]eam only, [n]o:").strip().lower()
             if remember == "t" and team_id:
                 rule.team_id = team_id
                 self.repairs.save_rule(rule, sample_value=value)
