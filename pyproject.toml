@@ -3,9 +3,9 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "trec_anon"
+name = "track_veil"
 dynamic = ["version"]
-description = "Anonymizing trec data sets."
+description = "Anonymizing track data sets for sharing."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
@@ -34,17 +34,17 @@ test = [
 ]
 
 [project.scripts]
-trec-anon = "trec_anon_lib.anonymizer.cli:main"
+track-veil = "track_veil_lib.anonymizer.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/trec-auto-judge/trec_anon"
+Homepage = "https://github.com/trec-auto-judge/track_veil"
 # "Bug Tracker" = "https://github.com/trec-auto-judge/auto-judge-code/issues"
 
 [tool.hatch.version]
-path = "trec_anon_lib/__init__.py"
+path = "track_veil_lib/__init__.py"
 
 [tool.hatch.build.targets.wheel]
-packages = ["trec_anon_lib"]
+packages = ["track_veil_lib"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -62,7 +62,7 @@ class PipelineStats:
 
 
 class AnonymizationPipeline:
-    """Main pipeline for anonymizing TREC data.
+    """Main pipeline for anonymizing track data.
 
     Usage:
         config = PipelineConfig(

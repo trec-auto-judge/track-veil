@@ -6,8 +6,8 @@ import tempfile
 import shutil
 from pathlib import Path
 
-from trec_anon_lib.anonymizer.pipeline import AnonymizationPipeline, PipelineConfig
-from trec_anon_lib.anonymizer.mapping import MappingStore
+from track_veil_lib.anonymizer.pipeline import AnonymizationPipeline, PipelineConfig
+from track_veil_lib.anonymizer.mapping import MappingStore
 
 
 @pytest.fixture

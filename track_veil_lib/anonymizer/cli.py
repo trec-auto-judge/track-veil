@@ -1,4 +1,4 @@
-"""Command-line interface for TREC data anonymization."""
+"""Command-line interface for track data anonymization."""
 
 import click
 from pathlib import Path
@@ -11,9 +11,9 @@ from .pipeline import AnonymizationPipeline, PipelineConfig
 @click.group()
 @click.version_option(version="0.1.0")
 def cli():
-    """TREC Data Anonymization Tool.
+    """Track Veil - Data Anonymization Tool.
 
-    Anonymize team and run identifiers in TREC datasets while preserving
+    Anonymize team and run identifiers in track datasets while preserving
     data structure for sharing.
     """
     pass
@@ -25,7 +25,7 @@ def cli():
     "input_dir",
     type=click.Path(exists=True, file_okay=False, path_type=Path),
     required=True,
-    help="Input directory containing TREC data",
+    help="Input directory containing track data",
 )
 @click.option(
     "--output", "-o",
@@ -90,7 +90,7 @@ def anonymize(
     error_report: Optional[Path],
     priority_filter: Optional[str],
 ):
-    """Anonymize a TREC dataset.
+    """Anonymize a track dataset.
 
     Replaces team and run identifiers with random pseudonyms.
     Mappings are stored in a SQLite database for consistency and

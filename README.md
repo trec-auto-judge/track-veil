@@ -1,6 +1,12 @@
-# TREC Data Anonymization
+# Track Veil
 
-Anonymize team and run identifiers in TREC datasets for sharing.
+Anonymize team and run identifiers in track datasets for sharing. 
+
+Runs: Supports rankings in trec-run format and `Report` format of TREC RAG, RAGTIME, DRAGUN, etc.
+Eval: Supports evaluation output from `trec_eval`, `ir_measures`, `tot` (TREC Tip of the Tounge)
+Metadata: Evalbase metadata
+
+Run track_
 
 ## Installation
 
@@ -21,33 +27,31 @@ The input directory must **directly contain** `runs/`, `eval/`, and `metadata/` 
 
 ```bash
 # Anonymize and export only priority 1 runs (primary use case)
-uv run trec-anon anonymize \
-  -i rag-export \
-  -o rag-anon \
+uv run track-veil anonymize \
+  -i track-export \
+  -o track-anon \
   -m mapping.db \
   --priority "1 (top)"
 
 # Show mappings
-uv run trec-anon show-mapping -m mapping.db
+uv run track-veil show-mapping -m mapping.db
 
 # Reverse lookup
-uv run trec-anon reverse-lookup -m mapping.db T042-bear
+uv run track-veil reverse-lookup -m mapping.db T042-bear
 
 # Recover mappings from anonymized reports (if mapping.db is lost)
-uv run trec-anon recover-mapping -m mapping.db -i anon_data/runs/
+uv run track-veil recover-mapping -m mapping.db -i anon_data/runs/
 
 # Example with test data
-uv run trec-anon anonymize \
+uv run track-veil anonymize \
   -i data/fake \
   -o data/anon \
-  -m mapping.db \
-  --no-interactive \
-  --priority "1 (top)"
+  -m mapping.db
 ```
 
 
 
-Description of raw TREC datasets, for cleaning and anonymization pipeline.
+Description of raw track datasets (e.g. from TREC), for cleaning and anonymization pipeline.
 
 Below we specify the data layout and how to parse variables from the file name or content info. 
 
@@ -165,8 +169,8 @@ During anonymization, content fingerprints (SHA256 of topic_id + report text) ar
 
 ```bash
 # Recover/verify mappings from anonymized reports
-uv run trec-anon recover-mapping -m mapping.db -i anon_data/runs/ -f table
-uv run trec-anon recover-mapping -m mapping.db -i anon_data/runs/ -f csv -o recovered.csv
+uv run track-veil recover-mapping -m mapping.db -i anon_data/runs/ -f table
+uv run track-veil recover-mapping -m mapping.db -i anon_data/runs/ -f csv -o recovered.csv
 ```
 
 ### Email handling

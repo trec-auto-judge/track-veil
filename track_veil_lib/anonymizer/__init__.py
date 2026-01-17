@@ -1,4 +1,4 @@
-"""TREC data anonymization package."""
+"""Track data anonymization package."""
 
 from .mapping import MappingStore, compute_report_fingerprint
 from .pseudonyms import PseudonymPool

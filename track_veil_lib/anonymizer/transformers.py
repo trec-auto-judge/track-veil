@@ -3,7 +3,7 @@
 Handles:
 - Report JSONL (team_id, run_id in metadata)
 - Metadata JSONL (runtag, org, email warning)
-- TSV/WSV files (various TREC formats)
+- TSV/WSV files (various track formats)
 """
 
 import json

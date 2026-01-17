@@ -4,7 +4,7 @@ import pytest
 import tempfile
 from pathlib import Path
 
-from trec_anon_lib.anonymizer.mapping import (
+from track_veil_lib.anonymizer.mapping import (
     MappingStore,
     compute_report_fingerprint,
 )

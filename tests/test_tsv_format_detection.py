@@ -1,7 +1,7 @@
 """Tests for TSV format detection."""
 
 import pytest
-from trec_anon_lib.anonymizer.transformers import detect_tsv_format, TsvFormat
+from track_veil_lib.anonymizer.transformers import detect_tsv_format, TsvFormat
 
 
 class TestHeaderDetection:
