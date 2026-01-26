@@ -325,3 +325,44 @@ track_veil_lib/
 - **Format override flag:** Allow forcing TSV format without interactive confirmation
 - **Incremental processing:** Skip already-processed files based on fingerprints
 - **Dry-run improvements:** Currently minimal — could show more detail
+
+### TSV Processing Consolidation
+
+Currently there are multiple similar code paths for TSV processing:
+
+| Function | Location | Used By | Creates Mappings? |
+|----------|----------|---------|-------------------|
+| `_copy_tsv_with_anonymization()` | pipeline.py | runs/ | Yes (`get_or_create_team`) |
+| `_copy_tsv_with_replaced_run_id()` | pipeline.py | eval/ | No (`get_team` lookup only) |
+| `_copy_trec_eval_with_anon_runid()` | pipeline.py | eval/ (trec_eval format) | No |
+| `TsvTransformer.transform_file()` | transformers.py | eval/ fallback | Configurable |
+
+**Shared functionality:**
+- Header row handling (skip first data line)
+- Separator preservation (tab vs space)
+- Run_id column replacement
+- Team column anonymization
+- Special case for trec_eval "runid" metric line
+
+**Key difference:** Whether to create new mappings or just lookup existing ones.
+
+**Refactoring suggestion:** Consolidate into a single `_process_tsv_file()` with parameters:
+```python
+def _process_tsv_file(
+    self,
+    input_path: Path,
+    output_path: Path,
+    run_id_cols: List[int],
+    replacement_run_id: str,
+    team_cols: List[int] = None,
+    has_header: bool = False,
+    create_team_mappings: bool = False,  # True for runs/, False for eval/
+) -> Tuple[int, List[str]]:
+    """Unified TSV processing."""
+```
+
+**Benefits:**
+- Single source of truth for TSV processing logic
+- Easier to maintain header handling, separator preservation, etc.
+- Clearer semantic distinction via `create_team_mappings` flag
+- `TsvTransformer` class in transformers.py could potentially be removed or simplified

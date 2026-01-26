@@ -86,9 +86,9 @@ class AnonymizationPipeline:
         # Priority map: {(team, run) -> priority} or {run_id -> priority}
         self._priority_map: Dict[str, str] = {}
 
-        # Task format cache: {task_dir -> (TsvFormat, run_id_columns)}
+        # Task format cache: {task_dir -> (TsvFormat, run_id_columns, team_columns, has_header)}
         # All files in a task directory share the same format
-        self._task_format_cache: Dict[Path, Tuple[TsvFormat, List[int]]] = {}
+        self._task_format_cache: Dict[Path, Tuple[TsvFormat, List[int], List[int], bool]] = {}
 
         # Eval filename pattern cache: {task_dir -> judge_suffix}
         # e.g., ".qrel_eval", ".nist-edit", or None if filenames don't follow {run_id}.{judge}
@@ -143,11 +143,15 @@ class AnonymizationPipeline:
         file_path: Path,
         hint: TsvFormatHint,
         sample_lines: List[str] = None,
-    ) -> Tuple[TsvFormat, List[int]]:
-        """Ask user to confirm TSV format."""
+    ) -> Tuple[TsvFormat, List[int], List[int], bool]:
+        """Ask user to confirm TSV format.
+
+        Returns:
+            Tuple of (format, run_id_columns, team_columns, has_header)
+        """
         if not self.config.interactive:
-            # Use hint
-            return hint.likely_format, hint.run_id_columns
+            # Use hint (no team columns for predefined formats, no header skip)
+            return hint.likely_format, hint.run_id_columns, [], False
 
         task_name = file_path.parent.name
         print(f"\nDetected TSV format:")
@@ -171,8 +175,9 @@ class AnonymizationPipeline:
         options = [
             (f"{fmt.value} - run_id in column(s) {self._format_columns(fmt)}", fmt)
             for fmt in TsvFormat
-            if fmt != TsvFormat.UNKNOWN
+            if fmt not in (TsvFormat.UNKNOWN, TsvFormat.CUSTOM)
         ]
+        options.append(("Custom - specify run_id column number", "custom"))
         options.append(("Skip this file", None))
 
         # Put likely format first
@@ -185,9 +190,43 @@ class AnonymizationPipeline:
         selected_format = options[choice][1]
 
         if selected_format is None:
-            return TsvFormat.UNKNOWN, []
+            return TsvFormat.UNKNOWN, [], [], False
 
-        return selected_format, self._get_run_id_columns(selected_format)
+        if selected_format == "custom":
+            # Ask user for column numbers (0-indexed, comma-separated)
+            def parse_columns(prompt: str) -> List[int]:
+                try:
+                    col_str = input(prompt).strip()
+                    if not col_str:
+                        return []
+                    cols = []
+                    for part in col_str.split(","):
+                        part = part.strip()
+                        if part:
+                            col = int(part)
+                            if col >= 0:
+                                cols.append(col)
+                    return cols
+                except (ValueError, EOFError):
+                    return []
+
+            # Ask about header row first
+            header_input = input("Does the first row contain column headers? (y/n, default=n): ").strip().lower()
+            has_header = header_input in ("y", "yes")
+
+            run_id_cols = parse_columns("Enter run_id column(s) (0-indexed, comma-separated, or Enter to skip): ")
+            team_cols = parse_columns("Enter team column(s) (0-indexed, comma-separated, or Enter to skip): ")
+
+            if run_id_cols or team_cols:
+                print(f"  Using run_id columns={run_id_cols}, team columns={team_cols}, header={has_header}")
+            else:
+                print("  No columns specified")
+
+            return TsvFormat.CUSTOM, run_id_cols, team_cols, has_header
+
+        # Predefined formats don't have team columns, assume no header for simplicity
+        # (header detection is done in detect_tsv_format for known formats)
+        return selected_format, self._get_run_id_columns(selected_format), [], False
 
     def _format_columns(self, fmt: TsvFormat) -> str:
         """Get column description for format."""
@@ -297,11 +336,18 @@ class AnonymizationPipeline:
                     f_out.write(line)
                     continue
 
-                parts = stripped.split()  # Handle both tabs and spaces
+                # Preserve separator: use tab if present, else space
+                if "\t" in stripped:
+                    sep = "\t"
+                    parts = stripped.split("\t")
+                else:
+                    sep = " "
+                    parts = stripped.split()
+
                 # Check for runid metric line: "runid <topic> <value>"
                 if len(parts) >= 3 and parts[0].lower() == "runid":
                     parts[2] = anon_run_id
-                    f_out.write("\t".join(parts) + "\n")
+                    f_out.write(sep.join(parts) + "\n")
                 else:
                     f_out.write(line)
 
@@ -567,7 +613,9 @@ class AnonymizationPipeline:
 
         # Track format for this task (all files in a task should be same format)
         task_format = None
-        task_tsv_cols = None
+        task_run_cols = None  # run_id columns
+        task_team_cols = None  # team columns
+        task_has_header = False  # whether first row is header
 
         for run_file in task_dir.iterdir():
             if run_file.is_dir():
@@ -590,11 +638,11 @@ class AnonymizationPipeline:
             if task_format is None:
                 task_format = self._detect_file_format(run_file)
                 if task_format == "tsv":
-                    # Detect TSV format and get run_id columns
+                    # Detect TSV format and get run_id/team columns
                     with open(run_file, "r") as f:
                         sample_lines = f.readlines()[:20]
                     hint = detect_tsv_format(sample_lines)
-                    fmt, task_tsv_cols = self._ask_tsv_format(
+                    fmt, task_run_cols, task_team_cols, task_has_header = self._ask_tsv_format(
                         run_file, hint, sample_lines
                     )
                     if fmt != TsvFormat.UNKNOWN:
@@ -613,11 +661,12 @@ class AnonymizationPipeline:
                 )
             else:
                 # TSV format (ranking file)
-                if task_tsv_cols:
+                if task_run_cols or task_team_cols:
                     # For runs/, filename is source of truth - replace content run_ids
-                    # with the anonymized run_id from the filename
-                    lines = self._copy_tsv_with_replaced_run_id(
-                        run_file, temp_output, task_tsv_cols, anon_filename
+                    # with the anonymized run_id from the filename, also anonymize team columns
+                    lines = self._copy_tsv_with_anonymization(
+                        run_file, temp_output, task_run_cols or [], task_team_cols or [],
+                        anon_filename, task_has_header
                     )
                 else:
                     # Unknown format, just copy
@@ -689,6 +738,8 @@ class AnonymizationPipeline:
         output_path: Path,
         run_id_cols: List[int],
         replacement_run_id: str,
+        team_cols: Optional[List[int]] = None,
+        has_header: bool = False,
     ) -> int:
         """Copy TSV file, replacing all values in run_id columns with a single value.
 
@@ -697,32 +748,134 @@ class AnonymizationPipeline:
             output_path: Destination file
             run_id_cols: Which columns contain run_id values to replace
             replacement_run_id: The value to use for all run_id columns
+            team_cols: Which columns contain team names to anonymize (lookup only)
+            has_header: If True, first non-comment line is header (copy as-is)
 
         Returns:
             Number of data lines processed
         """
         output_path.parent.mkdir(parents=True, exist_ok=True)
         count = 0
+        first_data_line = True
+        team_cols = team_cols or []
+
         with open(input_path, "r") as fin, open(output_path, "w") as fout:
             for line in fin:
                 stripped = line.strip()
                 if not stripped or stripped.startswith("#"):
                     fout.write(line)
                     continue
-                parts = stripped.split()
+
+                # Skip header line (copy as-is)
+                if has_header and first_data_line:
+                    first_data_line = False
+                    fout.write(line)
+                    continue
+
+                first_data_line = False
+
+                # Preserve separator: use tab if present, else space
+                if "\t" in stripped:
+                    sep = "\t"
+                    parts = stripped.split("\t")
+                else:
+                    sep = " "
+                    parts = stripped.split()
 
                 # Replace run_id in specified columns
                 for col_idx in run_id_cols:
                     if col_idx < len(parts):
                         parts[col_idx] = replacement_run_id
 
+                # Anonymize team columns (lookup only - don't create new mappings for eval)
+                for col_idx in team_cols:
+                    if col_idx < len(parts):
+                        original_team = parts[col_idx]
+                        anon_team = self.mapping.get_team(original_team)
+                        if anon_team:
+                            parts[col_idx] = anon_team
+                        # If not found, leave as-is (don't create mapping in eval)
+
                 # Special case: trec_eval "runid" metric line
                 # Format: topic  metric  value  where metric="runid"
                 if len(parts) >= 3 and parts[1].lower() == "runid":
                     parts[2] = replacement_run_id
 
-                fout.write("\t".join(parts) + "\n")
+                fout.write(sep.join(parts) + "\n")
                 count += 1
+        return count
+
+    def _copy_tsv_with_anonymization(
+        self,
+        input_path: Path,
+        output_path: Path,
+        run_id_cols: List[int],
+        team_cols: List[int],
+        replacement_run_id: str,
+        has_header: bool = False,
+    ) -> int:
+        """Copy TSV file, anonymizing run_id and team columns.
+
+        Args:
+            input_path: Source TSV file
+            output_path: Destination file
+            run_id_cols: Which columns contain run_id values to replace
+            team_cols: Which columns contain team names to anonymize
+            replacement_run_id: The value to use for all run_id columns
+            has_header: If True, first non-comment line is header (copy as-is)
+
+        Returns:
+            Number of data lines processed
+        """
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        count = 0
+        first_data_line = True
+
+        with open(input_path, "r") as fin, open(output_path, "w") as fout:
+            for line in fin:
+                stripped = line.strip()
+
+                # Pass through empty lines and comments
+                if not stripped or stripped.startswith("#"):
+                    fout.write(line)
+                    continue
+
+                # Skip header line (copy as-is)
+                if has_header and first_data_line:
+                    first_data_line = False
+                    fout.write(line)
+                    continue
+
+                first_data_line = False
+
+                # Preserve separator: use tab if present, else space
+                if "\t" in stripped:
+                    sep = "\t"
+                    parts = stripped.split("\t")
+                else:
+                    sep = " "
+                    parts = stripped.split()
+
+                # Replace run_id in specified columns
+                for col_idx in run_id_cols:
+                    if col_idx < len(parts):
+                        parts[col_idx] = replacement_run_id
+
+                # Anonymize team columns (look up/create mapping)
+                for col_idx in team_cols:
+                    if col_idx < len(parts):
+                        original_team = parts[col_idx]
+                        anon_team = self.mapping.get_or_create_team(original_team)
+                        parts[col_idx] = anon_team
+
+                # Special case: trec_eval "runid" metric line
+                # Format: topic  metric  value  where metric="runid"
+                if len(parts) >= 3 and parts[1].lower() == "runid":
+                    parts[2] = replacement_run_id
+
+                fout.write(sep.join(parts) + "\n")
+                count += 1
+
         return count
 
     def _process_eval_task(self, task_dir: Path, input_dir: Path, output_dir: Path):
@@ -756,7 +909,7 @@ class AnonymizationPipeline:
 
             # Check if we have a cached format for this task directory
             if task_dir in self._task_format_cache:
-                fmt, run_id_cols = self._task_format_cache[task_dir]
+                fmt, run_id_cols, team_cols, has_header = self._task_format_cache[task_dir]
             else:
                 # Detect format for first file in this task
                 with open(eval_file, "r") as f:
@@ -769,12 +922,14 @@ class AnonymizationPipeline:
                 if override_key in self.config.tsv_formats:
                     fmt = self.config.tsv_formats[override_key]
                     run_id_cols = self._get_run_id_columns(fmt)
+                    team_cols = []
+                    has_header = False
                 else:
-                    fmt, run_id_cols = self._ask_tsv_format(eval_file, hint, sample_lines)
+                    fmt, run_id_cols, team_cols, has_header = self._ask_tsv_format(eval_file, hint, sample_lines)
 
                 # Cache format for this task directory (even if no run_id columns, like trec_eval)
                 if fmt != TsvFormat.UNKNOWN:
-                    self._task_format_cache[task_dir] = (fmt, run_id_cols)
+                    self._task_format_cache[task_dir] = (fmt, run_id_cols, team_cols, has_header)
                     if self.config.interactive:
                         print(f"  (Using {fmt.value} format for all files in {task_dir.name}/)")
 
@@ -862,7 +1017,8 @@ class AnonymizationPipeline:
                 anon_run = self.mapping.get_run(extracted_run_id)
                 if anon_run:
                     lines = self._copy_tsv_with_replaced_run_id(
-                        eval_file, temp_output, run_id_cols, anon_run
+                        eval_file, temp_output, run_id_cols, anon_run,
+                        team_cols=team_cols, has_header=has_header,
                     )
                     self.stats.files_processed += 1
                     self.stats.lines_processed += lines

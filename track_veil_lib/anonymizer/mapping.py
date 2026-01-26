@@ -312,6 +312,28 @@ class MappingStore:
             }
         return None
 
+    def get_fingerprints_by_topic(self, topic_id: str) -> list[Dict[str, Any]]:
+        """Get all fingerprints stored for a given topic_id.
+
+        Useful for debugging why a fingerprint didn't match.
+        """
+        cur = self._conn.cursor()
+        cur.execute(
+            """SELECT fingerprint, original_team, original_run, anon_team, anon_run
+               FROM report_fingerprints WHERE topic_id = ?""",
+            (topic_id,),
+        )
+        return [
+            {
+                "fingerprint": row["fingerprint"],
+                "original_team": row["original_team"],
+                "original_run": row["original_run"],
+                "anon_team": row["anon_team"],
+                "anon_run": row["anon_run"],
+            }
+            for row in cur.fetchall()
+        ]
+
     @property
     def seed(self) -> int:
         return self._seed

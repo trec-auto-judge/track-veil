@@ -35,7 +35,8 @@ class TsvFormat(str, Enum):
     IR_MEASURES = "ir_measures"  # {run_id} {topic} {measure} {value}
     TREC_EVAL = "trec_eval"      # {topic} {measure} {value}
     RANKING = "ranking"          # {topic} Q0 {doc_id} {rank} {score} {run_id}
-    UNKNOWN = "unknown"
+    CUSTOM = "custom"            # User-specified columns
+    UNKNOWN = "unknown"          # Skip file
 
 
 @dataclass
