@@ -927,6 +927,237 @@ def select_priority(
             click.echo(f"    ... and {len(not_found) - 10} more")
 
 
+def _read_topic_ids_from_stdin() -> set[str]:
+    """Read topic IDs from stdin, one per line."""
+    import sys
+    topic_ids: set[str] = set()
+    for line in sys.stdin:
+        line = line.strip()
+        if line:
+            topic_ids.add(line)
+    return topic_ids
+
+
+def _filter_report_jsonl(input_path: Path, output_path: Path, topic_ids: set[str]) -> tuple[int, int, int]:
+    """Filter Report JSONL file to only include matching topic_ids.
+
+    Only keeps the first report per topic (drops duplicates).
+
+    Returns (kept_lines, duplicates_dropped, total_lines).
+    """
+    import json
+    kept = 0
+    duplicates = 0
+    total = 0
+    seen_topics: set[str] = set()
+
+    with open(input_path, 'r') as inf, open(output_path, 'w') as outf:
+        for line in inf:
+            total += 1
+            line_stripped = line.strip()
+            if not line_stripped:
+                continue
+            try:
+                data = json.loads(line_stripped)
+                # Check metadata.topic_id or top-level topic_id
+                topic_id = None
+                if isinstance(data.get("metadata"), dict):
+                    topic_id = str(data["metadata"].get("topic_id", ""))
+                if not topic_id:
+                    topic_id = str(data.get("topic_id", ""))
+                if not topic_id:
+                    # Also check narrative_id
+                    if isinstance(data.get("metadata"), dict):
+                        topic_id = str(data["metadata"].get("narrative_id", ""))
+                    if not topic_id:
+                        topic_id = str(data.get("narrative_id", ""))
+
+                if topic_id in topic_ids:
+                    if topic_id in seen_topics:
+                        duplicates += 1
+                    else:
+                        seen_topics.add(topic_id)
+                        outf.write(line)
+                        kept += 1
+            except json.JSONDecodeError:
+                # Skip malformed lines
+                continue
+
+    return kept, duplicates, total
+
+
+def _filter_ranking_tsv(input_path: Path, output_path: Path, topic_ids: set[str]) -> tuple[int, int]:
+    """Filter Ranking TSV file to only include matching topic_ids.
+
+    Ranking format: {topic} Q0 {doc_id} {rank} {score} {run_id}
+    Topic is column 0.
+
+    Returns (kept_lines, total_lines).
+    """
+    kept = 0
+    total = 0
+
+    with open(input_path, 'r') as inf, open(output_path, 'w') as outf:
+        for line in inf:
+            total += 1
+            line_stripped = line.strip()
+            if not line_stripped or line_stripped.startswith('#'):
+                outf.write(line)  # Preserve comments/empty lines
+                continue
+
+            parts = line_stripped.split()
+            if len(parts) >= 1:
+                topic_id = parts[0]
+                if topic_id in topic_ids:
+                    outf.write(line)
+                    kept += 1
+
+    return kept, total
+
+
+def _detect_file_type(file_path: Path) -> str:
+    """Detect if file is 'jsonl' or 'tsv' based on content."""
+    try:
+        with open(file_path, 'r') as f:
+            first_line = f.readline().strip()
+            if not first_line:
+                return "unknown"
+            if first_line.startswith('{'):
+                return "jsonl"
+            # Check if it looks like ranking TSV (6 columns, col 1 is "Q0")
+            parts = first_line.split()
+            if len(parts) >= 6 and parts[1] == "Q0":
+                return "tsv"
+            # Default to TSV for other whitespace-separated formats
+            if len(parts) >= 2:
+                return "tsv"
+    except Exception:
+        pass
+    return "unknown"
+
+
+@cli.command("ensure-topics")
+@click.option(
+    "--runs", "-r",
+    "runs_dir",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    required=True,
+    help="Input runs directory containing run files (Report JSONL or Ranking TSV)",
+)
+@click.option(
+    "--output", "-o",
+    "output_dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    required=True,
+    help="Output directory for filtered files",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Show what would be done without making changes",
+)
+@click.option(
+    "--verbose", "-v",
+    is_flag=True,
+    help="Show detailed progress",
+)
+def ensure_topics(
+    runs_dir: Path,
+    output_dir: Path,
+    dry_run: bool,
+    verbose: bool,
+):
+    """Filter run files to only include specified topics.
+
+    Reads topic IDs from stdin (one per line) and filters each run file
+    to only include entries for those topics.
+
+    Supports:
+    - Report JSONL files (filters by metadata.topic_id)
+    - Ranking TSV files (filters by first column)
+
+    Example:
+        cat topics.txt | track-veil ensure-topics -r runs/ -o filtered/
+        jq -r '.topic_id' requests.jsonl | track-veil ensure-topics -r runs/ -o filtered/
+    """
+    import sys
+
+    # Check if stdin has data
+    if sys.stdin.isatty():
+        raise click.ClickException(
+            "No topic IDs provided on stdin. Pipe topic IDs (one per line) to this command.\n"
+            "Example: cat topics.txt | track-veil ensure-topics -r runs/ -o filtered/"
+        )
+
+    topic_ids = _read_topic_ids_from_stdin()
+    click.echo(f"Read {len(topic_ids)} topic IDs from stdin")
+
+    if verbose:
+        shown = sorted(topic_ids)[:10]
+        click.echo(f"Topics: {shown}{'...' if len(topic_ids) > 10 else ''}")
+
+    if not topic_ids:
+        click.echo("No topic IDs provided. Nothing to do.")
+        return
+
+    # Find all files in runs directory
+    run_files = sorted([f for f in runs_dir.iterdir() if f.is_file()])
+    click.echo(f"Found {len(run_files)} files in {runs_dir}")
+
+    if not dry_run:
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+    stats = {"jsonl": 0, "tsv": 0, "unknown": 0, "empty": 0, "kept_lines": 0, "duplicates": 0, "total_lines": 0}
+
+    for run_file in run_files:
+        file_type = _detect_file_type(run_file)
+        stats[file_type] = stats.get(file_type, 0) + 1
+
+        if file_type == "unknown":
+            if verbose:
+                click.echo(f"  [skip] {run_file.name} (unknown format)")
+            continue
+
+        out_file = output_dir / run_file.name
+
+        if dry_run:
+            click.echo(f"  [dry-run] {run_file.name} ({file_type})")
+            continue
+
+        if file_type == "jsonl":
+            kept, duplicates, total = _filter_report_jsonl(run_file, out_file, topic_ids)
+            stats["duplicates"] += duplicates
+        else:  # tsv
+            kept, total = _filter_ranking_tsv(run_file, out_file, topic_ids)
+            duplicates = 0
+
+        stats["kept_lines"] += kept
+        stats["total_lines"] += total
+
+        dropped = total - kept - duplicates
+
+        # Remove output file if all lines were dropped
+        if kept == 0:
+            out_file.unlink(missing_ok=True)
+            stats["empty"] += 1
+            if verbose:
+                click.echo(f"  [empty] {run_file.name}: all {total} lines dropped, not written")
+        elif verbose:
+            dup_msg = f", {duplicates} duplicates" if duplicates else ""
+            click.echo(f"  {run_file.name}: {kept} kept, {dropped} dropped{dup_msg} (of {total})")
+
+    # Summary
+    click.echo(f"\nSummary:")
+    click.echo(f"  Topic IDs: {len(topic_ids)}")
+    click.echo(f"  Files processed: {stats['jsonl']} JSONL, {stats['tsv']} TSV, {stats['unknown']} skipped")
+    if not dry_run:
+        written = stats['jsonl'] + stats['tsv'] - stats['unknown'] - stats['empty']
+        click.echo(f"  Files written: {written} ({stats['empty']} empty, not written)")
+        dup_msg = f" ({stats['duplicates']} duplicate topics dropped)" if stats['duplicates'] else ""
+        click.echo(f"  Lines kept: {stats['kept_lines']}/{stats['total_lines']}{dup_msg}")
+        click.echo(f"  Output: {output_dir}")
+
+
 def main():
     cli()
 
