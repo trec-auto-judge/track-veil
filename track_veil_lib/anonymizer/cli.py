@@ -9,7 +9,7 @@ from .pipeline import AnonymizationPipeline, PipelineConfig
 
 
 @click.group()
-@click.version_option(version="0.1.0")
+@click.version_option(version="0.4.5")
 def cli():
     """Track Veil - Data Anonymization Tool.
 
@@ -73,6 +73,18 @@ def cli():
     default=None,
     help='Only process runs with this priority (e.g., "1 (top)")',
 )
+@click.option(
+    "--save-decisions",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help="Save interactive decisions to YAML file for reproducible runs",
+)
+@click.option(
+    "--load-decisions",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Load decisions from YAML file (skips interactive prompts)",
+)
 def anonymize(
     input_dir: Path,
     output_dir: Path,
@@ -83,6 +95,8 @@ def anonymize(
     dry_run: bool,
     error_report: Optional[Path],
     priority_filter: Optional[str],
+    save_decisions: Optional[Path],
+    load_decisions: Optional[Path],
 ):
     """Anonymize a track dataset.
 
@@ -102,6 +116,8 @@ def anonymize(
         metadata_dir=metadata_dir,
         dry_run=dry_run,
         priority_filter=priority_filter,
+        save_decisions=save_decisions,
+        load_decisions=load_decisions,
     )
 
     pipeline = AnonymizationPipeline(config)
@@ -374,7 +390,7 @@ def recover_mapping(
 
             file_lines = 0
             file_parsed = 0
-            with open(file_path, "r") as f:
+            with open(file_path, "rt", encoding="utf-8") as f:
                 for line_num, line in enumerate(f, 1):
                     line = line.strip()
                     if not line:
@@ -488,7 +504,7 @@ def recover_mapping(
             unmatched_for_topic: list[dict] = []
             for file_path in files:
                 try:
-                    with open(file_path, "r") as fh:
+                    with open(file_path, "rt", encoding="utf-8") as fh:
                         for line_num, line in enumerate(fh, 1):
                             line = line.strip()
                             if not line:
@@ -523,7 +539,7 @@ def recover_mapping(
 
             for src_path in source_files_list:
                 try:
-                    with open(src_path, "r") as fh:
+                    with open(src_path, "rt", encoding="utf-8") as fh:
                         for line in fh:
                             line = line.strip()
                             if not line:
@@ -630,7 +646,7 @@ def recover_mapping(
             # Build fingerprint set by re-reading matched files from input
             matched_fingerprints: set[str] = set()
             for file_path in matched_files:
-                with open(file_path, "r") as f:
+                with open(file_path, "rt", encoding="utf-8") as f:
                     for line in f:
                         line = line.strip()
                         if not line:
@@ -666,7 +682,7 @@ def recover_mapping(
             for src_path in source_files:
                 file_has_match = False
                 try:
-                    with open(src_path, "r") as f:
+                    with open(src_path, "rt", encoding="utf-8") as f:
                         for line in f:
                             line = line.strip()
                             if not line:
@@ -701,7 +717,7 @@ def recover_mapping(
         output = _format_recovery_results(results, unmatched, output_format)
 
         if output_path:
-            with open(output_path, "w") as f:
+            with open(output_path, "wt", encoding="utf-8") as f:
                 f.write(output)
             click.echo(f"Results written to: {output_path}")
             click.echo(f"Matched: {len(results)}, Unmatched: {len(unmatched)}")
@@ -766,7 +782,7 @@ def _scan_metadata_for_priority(metadata_file: Path, priority_value: str) -> set
     matching_runtags: set[str] = set()
 
     try:
-        with open(metadata_file, "r") as f:
+        with open(metadata_file, "rt", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -951,7 +967,7 @@ def _filter_report_jsonl(input_path: Path, output_path: Path, topic_ids: set[str
     total = 0
     seen_topics: set[str] = set()
 
-    with open(input_path, 'r') as inf, open(output_path, 'w') as outf:
+    with open(input_path, 'rt', encoding="utf-8") as inf, open(output_path, 'wt', encoding="utf-8") as outf:
         for line in inf:
             total += 1
             line_stripped = line.strip()
@@ -997,7 +1013,7 @@ def _filter_ranking_tsv(input_path: Path, output_path: Path, topic_ids: set[str]
     kept = 0
     total = 0
 
-    with open(input_path, 'r') as inf, open(output_path, 'w') as outf:
+    with open(input_path, 'rt', encoding="utf-8") as inf, open(output_path, 'wt', encoding="utf-8") as outf:
         for line in inf:
             total += 1
             line_stripped = line.strip()
@@ -1018,7 +1034,7 @@ def _filter_ranking_tsv(input_path: Path, output_path: Path, topic_ids: set[str]
 def _detect_file_type(file_path: Path) -> str:
     """Detect if file is 'jsonl' or 'tsv' based on content."""
     try:
-        with open(file_path, 'r') as f:
+        with open(file_path, 'rt', encoding="utf-8") as f:
             first_line = f.readline().strip()
             if not first_line:
                 return "unknown"
@@ -1034,6 +1050,106 @@ def _detect_file_type(file_path: Path) -> str:
     except Exception:
         pass
     return "unknown"
+
+
+def _parse_official_eval_jsonl(eval_path: Path, task_name: str) -> dict:
+    """Parse official eval JSONL files for a task and extract stats.
+
+    Looks for files matching: eval/*.{task_name}.official.eval.jsonl
+
+    Returns dict with:
+        - topics: set of topic_ids (excluding "all" aggregates)
+        - measures: set of measure names
+        - runs: set of run_ids
+        - lines: total line count
+        - files: list of matched file paths
+    """
+    import json
+
+    result = {
+        "topics": set(),
+        "measures": set(),
+        "runs": set(),
+        "lines": 0,
+        "files": [],
+    }
+
+    eval_pattern = f"*.{task_name}.official.eval.jsonl"
+    official_eval_files = list(eval_path.glob(eval_pattern)) if eval_path.exists() else []
+    result["files"] = official_eval_files
+
+    for eval_file in official_eval_files:
+        try:
+            with open(eval_file, mode="rt", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    result["lines"] += 1
+                    try:
+                        data = json.loads(line)
+                        topic_id = data.get("topic_id")
+                        # Skip aggregate rows (topic_id == "all")
+                        if topic_id and topic_id != "all":
+                            result["topics"].add(str(topic_id))
+                        measure = data.get("measure")
+                        if measure:
+                            result["measures"].add(measure)
+                        run_id = data.get("run_id")
+                        if run_id:
+                            result["runs"].add(run_id)
+                    except json.JSONDecodeError:
+                        pass
+        except IOError:
+            pass
+
+    return result
+
+
+def _parse_metadata_for_prio1(data_dir: Path, task_name: str) -> dict:
+    """Parse metadata files for a task and extract prio1 runs.
+
+    Looks for files matching: metadata/{task_name}/*.jl
+
+    Returns dict with:
+        - prio1_runs: list of run_ids with std-priority "1 (top)" or "1 (highest)"
+        - all_runs: list of all run_ids in metadata
+        - files: list of matched file paths
+    """
+    import json
+
+    result = {
+        "prio1_runs": [],
+        "all_runs": [],
+        "files": [],
+    }
+
+    metadata_task_dir = data_dir / "metadata" / task_name
+    metadata_files = list(metadata_task_dir.glob("*.jl")) if metadata_task_dir.exists() else []
+    result["files"] = metadata_files
+
+    for metadata_path in metadata_files:
+        try:
+            with open(metadata_path, mode="rt", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line)
+                        run_id = data.get("runtag") or data.get("run_id")
+                        if run_id:
+                            result["all_runs"].append(run_id)
+                            # prio1 runs have std-priority == "1 (top)" or "1 (highest)"
+                            prio = data.get("std-priority", "")
+                            if prio in ("1 (top)", "1 (highest)"):
+                                result["prio1_runs"].append(run_id)
+                    except json.JSONDecodeError:
+                        pass
+        except IOError:
+            pass
+
+    return result
 
 
 @cli.command("ensure-topics")
@@ -1156,6 +1272,442 @@ def ensure_topics(
         dup_msg = f" ({stats['duplicates']} duplicate topics dropped)" if stats['duplicates'] else ""
         click.echo(f"  Lines kept: {stats['kept_lines']}/{stats['total_lines']}{dup_msg}")
         click.echo(f"  Output: {output_dir}")
+
+
+@cli.command("info")
+@click.option(
+    "--data", "-d",
+    "data_dir",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    required=True,
+    help="Anonymized data directory to analyze",
+)
+@click.option(
+    "--mapping", "-m",
+    "mapping_db",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Mapping database to look up teams from run_ids",
+)
+@click.option(
+    "--runs-dir",
+    default="runs",
+    help="Name of runs subdirectory (default: runs)",
+)
+@click.option(
+    "--eval-dir",
+    default="eval",
+    help="Name of eval subdirectory (default: eval)",
+)
+@click.option(
+    "--verbose", "-v",
+    is_flag=True,
+    help="Show detailed per-task breakdown",
+)
+@click.option(
+    "--markdown", "--md",
+    is_flag=True,
+    help="Output as GitHub-flavored markdown table",
+)
+def info_command(
+    data_dir: Path,
+    mapping_db: Optional[Path],
+    runs_dir: str,
+    eval_dir: str,
+    verbose: bool,
+    markdown: bool,
+):
+    """Show statistics about an anonymized dataset.
+
+    Reports on runs, topics, eval files, qrels, and leaderboards.
+
+    Example:
+        track-veil info -d data/anon/
+        track-veil info -d data/anon/ -m mapping.db -v
+    """
+    import json
+    from collections import Counter, defaultdict
+
+    click.echo(f"Dataset: {data_dir.resolve()}")
+
+    # Load mapping DB if provided (for run->team lookups)
+    run_to_team: dict[str, str] = {}
+    if mapping_db:
+        mapping = MappingStore(mapping_db)
+        run_to_team = mapping.get_anon_run_to_team()
+        click.echo(f"Mapping DB: {mapping_db} ({len(run_to_team)} run->team mappings)")
+
+    click.echo()
+
+    # Overall stats
+    total_runs = 0
+    total_topics: set[str] = set()
+    total_teams: set[str] = set()
+    total_lines = 0
+
+    # Per-task stats
+    task_stats: dict[str, dict] = defaultdict(lambda: {
+        "run_files": 0,      # Number of run files
+        "run_ids": set(),    # Unique run_ids (from content or filename)
+        "prio1_runs": [],    # Priority 1 run_ids (from metadata)
+        "teams": set(),      # Unique teams (JSONL only)
+        "topics": set(),
+        "lines": 0,
+        "format": "unknown",
+    })
+
+    # === RUNS DIRECTORY ===
+    runs_path = data_dir / runs_dir
+    if runs_path.exists():
+        click.echo(f"=== Runs ({runs_dir}/) ===")
+
+        for task_dir in sorted(runs_path.iterdir()):
+            if not task_dir.is_dir():
+                continue
+
+            task_name = task_dir.name
+            run_files = [f for f in task_dir.iterdir() if f.is_file()]
+
+            # Get prio1 runs from metadata
+            metadata_data = _parse_metadata_for_prio1(data_dir, task_name)
+            task_stats[task_name]["prio1_runs"] = metadata_data["prio1_runs"]
+
+            for run_file in run_files:
+                task_stats[task_name]["run_files"] += 1
+                total_runs += 1
+
+                # Filename is the run_id for anonymized data
+                run_id = run_file.name
+                task_stats[task_name]["run_ids"].add(run_id)
+
+                # Look up team from mapping DB
+                # Try full filename first, then stem (without extension)
+                team = run_to_team.get(run_id) or run_to_team.get(run_file.stem)
+                if team:
+                    task_stats[task_name]["teams"].add(team)
+                    total_teams.add(team)
+
+                # Detect format and extract stats
+                file_format = _detect_file_type(run_file)
+                task_stats[task_name]["format"] = file_format
+
+                if file_format == "jsonl":
+                    try:
+                        with open(run_file, mode="rt", encoding="utf-8") as f:
+                            for line in f:
+                                task_stats[task_name]["lines"] += 1
+                                total_lines += 1
+                                line = line.strip()
+                                if not line:
+                                    continue
+                                try:
+                                    data = json.loads(line)
+                                    # Extract topic_id and team_id
+                                    topic_id = None
+                                    if isinstance(data.get("metadata"), dict):
+                                        topic_id = str(data["metadata"].get("topic_id", ""))
+                                        team_id = data["metadata"].get("team_id", "")
+                                        if team_id:
+                                            task_stats[task_name]["teams"].add(team_id)
+                                            total_teams.add(team_id)
+                                    if topic_id:
+                                        task_stats[task_name]["topics"].add(topic_id)
+                                        total_topics.add(topic_id)
+                                except json.JSONDecodeError:
+                                    pass
+                    except IOError:
+                        pass
+                elif file_format == "tsv":
+                    # Ranking TSV: topic in column 0, run_id in column 5
+                    try:
+                        with open(run_file, mode="rt", encoding="utf-8") as f:
+                            for line in f:
+                                task_stats[task_name]["lines"] += 1
+                                total_lines += 1
+                                parts = line.strip().split()
+                                if len(parts) >= 6:
+                                    task_stats[task_name]["topics"].add(parts[0])
+                                    total_topics.add(parts[0])
+                    except IOError:
+                        pass
+
+        # Print runs summary
+        click.echo(f"  Total run files: {total_runs}")
+        if total_teams:
+            click.echo(f"  Total teams: {len(total_teams)}")
+        elif not run_to_team:
+            click.echo(f"  Total teams: (needs mapping DB for TSV files)")
+        else:
+            click.echo(f"  Total teams: 0")
+        click.echo(f"  Total topics: {len(total_topics)}")
+        click.echo(f"  Total lines: {total_lines}")
+
+        if verbose:
+            click.echo()
+            for task_name in sorted(task_stats.keys()):
+                ts = task_stats[task_name]
+                team_info = f", teams={len(ts['teams'])}"
+                click.echo(f"  [{task_name}] runs={ts['run_files']}{team_info}, "
+                          f"topics={len(ts['topics'])}, lines={ts['lines']}, format={ts['format']}")
+        click.echo()
+
+    # === EVAL DIRECTORY ===
+    eval_path = data_dir / eval_dir
+    eval_files_total = 0
+    eval_stats: dict[str, dict] = defaultdict(lambda: {
+        "files": 0,
+        "lines": 0,
+        "topics": set(),      # Assessed topics
+        "docs": set(),        # Assessed documents (qrels only)
+        "measures": set(),
+        "runs": set(),
+        "label_counts": Counter(),
+        "values": [],
+    })
+
+    if eval_path.exists():
+        click.echo(f"=== Eval ({eval_dir}/) ===")
+
+        # First, scan for official eval JSONL files at eval root: *.{task}.official.eval.jsonl
+        for task_name in task_stats.keys():
+            official_data = _parse_official_eval_jsonl(eval_path, task_name)
+            if official_data["files"]:
+                eval_stats[task_name]["files"] += len(official_data["files"])
+                eval_files_total += len(official_data["files"])
+                eval_stats[task_name]["lines"] += official_data["lines"]
+                eval_stats[task_name]["topics"].update(official_data["topics"])
+                eval_stats[task_name]["measures"].update(official_data["measures"])
+                eval_stats[task_name]["runs"].update(official_data["runs"])
+
+        # Also scan task subdirectories for other eval files (qrels, leaderboards, etc.)
+        for task_dir in sorted(eval_path.iterdir()):
+            if not task_dir.is_dir():
+                continue
+
+            task_name = task_dir.name
+            eval_files = [f for f in task_dir.iterdir() if f.is_file()]
+
+            for eval_file in eval_files:
+                eval_stats[task_name]["files"] += 1
+                eval_files_total += 1
+
+                # Parse eval file (could be qrels or leaderboard)
+                # Try to detect format from content
+                try:
+                    with open(eval_file, mode="rt", encoding="utf-8") as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line or line.startswith("#"):
+                                continue
+                            eval_stats[task_name]["lines"] += 1
+                            parts = line.split()
+
+                            # Qrels format: topic_id 0 doc_id relevance
+                            if len(parts) == 4 and parts[1] == "0":
+                                eval_stats[task_name]["topics"].add(parts[0])
+                                eval_stats[task_name]["docs"].add(parts[2])
+                                try:
+                                    label = int(parts[3])
+                                    eval_stats[task_name]["label_counts"][label] += 1
+                                except ValueError:
+                                    pass
+
+                            # Leaderboard formats (3-4 columns)
+                            elif len(parts) == 3:
+                                # trec_eval: measure topic value
+                                eval_stats[task_name]["measures"].add(parts[0])
+                                eval_stats[task_name]["topics"].add(parts[1])
+                                try:
+                                    eval_stats[task_name]["values"].append(float(parts[2]))
+                                except ValueError:
+                                    pass
+
+                            elif len(parts) == 4:
+                                # tot/ir_measures: run_id topic/measure measure/topic value
+                                eval_stats[task_name]["runs"].add(parts[0])
+                                try:
+                                    eval_stats[task_name]["values"].append(float(parts[3]))
+                                except ValueError:
+                                    pass
+
+                except IOError:
+                    pass
+
+        # Aggregate totals across tasks
+        total_assessed_topics: set[str] = set()
+        total_assessed_docs: set[str] = set()
+        total_eval_lines = 0
+        for es in eval_stats.values():
+            total_assessed_topics.update(es['topics'])
+            total_assessed_docs.update(es['docs'])
+            total_eval_lines += es['lines']
+
+        # Print eval summary
+        click.echo(f"  Total files: {eval_files_total}")
+        click.echo(f"  Total lines: {total_eval_lines}")
+        click.echo(f"  Assessed topics: {len(total_assessed_topics)}")
+        if total_assessed_docs:
+            click.echo(f"  Assessed docs: {len(total_assessed_docs)}")
+
+        if verbose:
+            click.echo()
+            for task_name in sorted(eval_stats.keys()):
+                es = eval_stats[task_name]
+                click.echo(f"  [{task_name}]")
+                click.echo(f"    files={es['files']}, lines={es['lines']}")
+
+                if es['topics']:
+                    click.echo(f"    assessed topics={len(es['topics'])}")
+                if es['docs']:
+                    click.echo(f"    assessed docs={len(es['docs'])}")
+                if es['measures']:
+                    click.echo(f"    measures={len(es['measures'])}: {sorted(es['measures'])[:5]}{'...' if len(es['measures']) > 5 else ''}")
+                if es['runs']:
+                    click.echo(f"    runs={len(es['runs'])}")
+
+                # Qrels label distribution
+                if es['label_counts']:
+                    labels = sorted(es['label_counts'].keys())
+                    click.echo(f"    qrels labels: min={min(labels)}, max={max(labels)}")
+                    click.echo(f"    distribution: {dict(sorted(es['label_counts'].items()))}")
+
+                # Value range for leaderboards
+                if es['values']:
+                    click.echo(f"    value range: [{min(es['values']):.4f}, {max(es['values']):.4f}]")
+
+        click.echo()
+
+    # === Markdown table output ===
+    if markdown:
+        click.echo()
+        click.echo("| track | task | teams | runs | prio1 | topics | assessed_topics | total_reports |")
+        click.echo("|:------------:|:---------:|-----:|-----:|------:|-------:|----------------:|--------------:|")
+
+        # Combine task_stats and eval_stats
+        all_tasks = set(task_stats.keys()) | set(eval_stats.keys())
+        for task_name in sorted(all_tasks):
+            ts = task_stats.get(task_name, {"run_files": 0, "prio1_runs": [], "teams": set(), "topics": set(), "lines": 0})
+            es = eval_stats.get(task_name, {"topics": set(), "lines": 0})
+
+            # Try to extract track from task name (e.g., "trec2025-rag-generation" -> "rag")
+            # or use data_dir name as track
+            track = data_dir.name
+
+            teams = len(ts.get("teams", set()))
+            runs = ts.get("run_files", 0)
+            prio1 = len(ts.get("prio1_runs", []))
+            topics = len(ts.get("topics", set()))
+            assessed_topics = len(es.get("topics", set()))
+            total_reports = ts.get("lines", 0)
+
+            click.echo(f"| {track} | {task_name} | {teams} | {runs} | {prio1} | {topics} | {assessed_topics} | {total_reports} |")
+
+        click.echo()
+        return
+
+    # === TODO notes ===
+    click.echo("=== TODO (not yet implemented) ===")
+    click.echo("  - Cross-file deduplication stats")
+
+
+@cli.command("generate-datasets-yml")
+@click.option(
+    "--data", "-d",
+    "data_dir",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    required=True,
+    help="Anonymized data directory to scan",
+)
+@click.option(
+    "--output", "-o",
+    "output_file",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help="Output file (default: datasets.yml in data directory)",
+)
+@click.option(
+    "--runs-dir",
+    default="runs",
+    help="Name of runs subdirectory (default: runs)",
+)
+@click.option(
+    "--eval-dir",
+    default="eval",
+    help="Name of eval subdirectory (default: eval)",
+)
+def generate_datasets_yml(
+    data_dir: Path,
+    output_file: Optional[Path],
+    runs_dir: str,
+    eval_dir: str,
+):
+    """Generate datasets.yml for use with run_all_datasets.py.
+
+    Scans an anonymized data directory and creates a datasets.yml file
+    with one entry per task, extracting assessed_topics from qrels.
+
+    Example:
+        track-veil generate-datasets-yml -d data/anon/
+        track-veil generate-datasets-yml -d data/anon/ -o my_datasets.yml
+    """
+    import yaml
+
+    if output_file is None:
+        output_file = data_dir / "datasets.yml"
+
+    datasets = []
+
+    # Scan runs directory for task names
+    runs_path = data_dir / runs_dir
+    eval_path = data_dir / eval_dir
+
+    if not runs_path.exists():
+        raise click.ClickException(f"Runs directory not found: {runs_path}")
+
+    for task_dir in sorted(runs_path.iterdir()):
+        if not task_dir.is_dir():
+            continue
+
+        task_name = task_dir.name
+
+        # Collect run IDs from filenames
+        run_ids = sorted([f.name for f in task_dir.iterdir() if f.is_file()])
+
+        # Extract prio1_runs from metadata file
+        metadata_data = _parse_metadata_for_prio1(data_dir, task_name)
+        prio1_runs = metadata_data["prio1_runs"]
+        click.echo(f"  [DEBUG] Looking for metadata at: {data_dir}/metadata/{task_name}/*.jl", err=True)
+        click.echo(f"  [DEBUG] Found metadata files: {[f.name for f in metadata_data['files']]}", err=True)
+        click.echo(f"  [DEBUG] Found {len(prio1_runs)} prio1 runs: {prio1_runs}", err=True)
+
+        # Extract assessed topics from official eval JSONL (if exists)
+        # Pattern: eval/*.{task}.official.eval.jsonl (at eval root, not in subdirs)
+        official_data = _parse_official_eval_jsonl(eval_path, task_name)
+        click.echo(f"  [DEBUG] Looking for eval at: {eval_path}/*.{task_name}.official.eval.jsonl", err=True)
+        click.echo(f"  [DEBUG] Found eval files: {[f.name for f in official_data['files']]}", err=True)
+        assessed_topics = sorted(official_data["topics"])
+
+        dataset_entry = {
+            "name": task_name,
+            "responses": str(task_dir),
+            "topics": "TODO: path to topics JSONL file",  # TODO: streamline this
+            "prio1_runs": prio1_runs,
+            "assessed_topics": assessed_topics,
+        }
+        datasets.append(dataset_entry)
+
+        click.echo(f"  {task_name}: {len(run_ids)} runs, {len(prio1_runs)} prio1, {len(assessed_topics)} assessed topics")
+
+    # Write YAML
+    output_data = {"datasets": datasets}
+
+    with open(output_file, "wt", encoding="utf-8") as f:
+        f.write("# Generated by track-veil generate-datasets-yml\n")
+        f.write("# TODO: Fill in 'topics' paths\n\n")
+        yaml.dump(output_data, f, default_flow_style=False, sort_keys=False)
+
+    click.echo(f"\nGenerated {output_file} with {len(datasets)} dataset(s)")
+    click.echo("NOTE: You must manually fill in 'topics' paths")
 
 
 def main():

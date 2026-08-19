@@ -173,7 +173,7 @@ class ErrorCollector:
         """Write issues to a JSONL file."""
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(output_path, "w") as f:
+        with open(output_path, "wt", encoding="utf-8") as f:
             for issue in self._issues:
                 f.write(json.dumps(issue.to_dict()) + "\n")
 

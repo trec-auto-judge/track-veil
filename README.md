@@ -11,7 +11,8 @@ Anonymize team and run identifiers in track datasets for sharing.
 | Original | Anonymized | Example |
 |----------|------------|---------|
 | team | "T" + 3-digit number | `T042`, `T911` |
-| run_id | plantimal name | `koala`, `oak` |
+| 2025 run_id | plantimal name | `koala`, `oak` |
+| 20265 run_id | baby name | `linda`, `john` |
 
 ## Installation
 

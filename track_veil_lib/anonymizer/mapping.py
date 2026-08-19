@@ -103,6 +103,13 @@ class MappingStore:
                 created_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS run_team_mappings (
+                original_run TEXT PRIMARY KEY,
+                original_team TEXT NOT NULL,
+                anon_run TEXT,
+                anon_team TEXT
+            );
+
             CREATE TABLE IF NOT EXISTS invalidated_names (
                 name_type TEXT NOT NULL,
                 name TEXT NOT NULL,
@@ -255,6 +262,51 @@ class MappingStore:
             "teams_remaining": self._pool.teams_remaining,
             "runs_remaining": self._pool.runs_remaining,
         }
+
+    def store_run_team(
+        self, original_run: str, original_team: str,
+        anon_run: Optional[str] = None, anon_team: Optional[str] = None
+    ) -> None:
+        """Store the run->team relationship (from metadata processing).
+
+        Stores both original and anonymized forms for direct lookups.
+        """
+        cur = self._conn.cursor()
+        cur.execute(
+            """INSERT OR REPLACE INTO run_team_mappings
+               (original_run, original_team, anon_run, anon_team)
+               VALUES (?, ?, ?, ?)""",
+            (original_run, original_team, anon_run, anon_team),
+        )
+        self._conn.commit()
+
+    def get_anon_run_to_team(self) -> Dict[str, str]:
+        """Return mapping of anonymized run_id to anonymized team.
+
+        Returns {anon_run: anon_team}.
+        """
+        cur = self._conn.cursor()
+        result = {}
+
+        # First, try direct mapping from run_team_mappings (if anon columns populated)
+        cur.execute("SELECT anon_run, anon_team FROM run_team_mappings WHERE anon_run IS NOT NULL")
+        for row in cur.fetchall():
+            if row["anon_run"] and row["anon_team"]:
+                result[row["anon_run"]] = row["anon_team"]
+
+        # Fall back to join approach for rows without anon columns (backwards compat)
+        cur.execute("""
+            SELECT rm.anonymized as anon_run, tm.anonymized as anon_team
+            FROM run_team_mappings rtm
+            JOIN run_mappings rm ON rtm.original_run = rm.original
+            JOIN team_mappings tm ON rtm.original_team = tm.original
+            WHERE rtm.anon_run IS NULL
+        """)
+        for row in cur.fetchall():
+            if row["anon_run"] and row["anon_team"]:
+                result[row["anon_run"]] = row["anon_team"]
+
+        return result
 
     def store_fingerprint(
         self,

@@ -22,10 +22,12 @@ classifiers = [
     "Topic :: Scientific/Engineering",
 ]
 dependencies = [
+    "autojudge-base>=0.4.5",
     "click",
     "pandas",
     "numpy",
     "pydantic>=2.0",
+    "PyYAML",
 ]
 
 [project.optional-dependencies]

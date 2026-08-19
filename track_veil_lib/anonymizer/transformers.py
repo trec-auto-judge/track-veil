@@ -517,7 +517,7 @@ class ReportTransformer:
         """
         output_path.parent.mkdir(parents=True, exist_ok=True)
         count = 0
-        with open(input_path, "r") as fin, open(output_path, "w") as fout:
+        with open(input_path, "rt", encoding="utf-8") as fin, open(output_path, "wt", encoding="utf-8") as fout:
             for line_num, line in enumerate(fin, 1):
                 line = line.strip()
                 if not line:
@@ -571,31 +571,41 @@ class MetadataTransformer:
             return None
 
         # Anonymize org (team) - check for mismatch with runs/ team
+        original_org = None
+        anon_org = None
         if "org" in data and data["org"]:
-            org = data["org"]
+            original_org = data["org"]
             runtag = data.get("runtag", "")
 
             # Check if this run has a different team from runs/
             if runtag:
                 expected_team = self.mapping.get_run_team(runtag)
-                if expected_team and expected_team != org:
-                    warn_key = (org, self._current_task)
+                if expected_team and expected_team != original_org:
+                    warn_key = (original_org, self._current_task)
                     if warn_key not in self._warned_team_mismatches:
                         self._warned_team_mismatches.add(warn_key)
                         print(f"  [WARNING] Team mismatch for run '{runtag}': "
-                              f"metadata.org='{org}' vs runs.team_id='{expected_team}'")
+                              f"metadata.org='{original_org}' vs runs.team_id='{expected_team}'")
 
-            data["org"] = self.mapping.get_or_create_team(org)
+            anon_org = self.mapping.get_or_create_team(original_org)
+            data["org"] = anon_org
 
         # Anonymize runtag (run_id)
         # Warn if creating new mapping - run_id should normally come from runs/
+        original_run = None
+        anon_run = None
         if "runtag" in data and data["runtag"]:
             original_run = data["runtag"]
             existing = self.mapping.get_run(original_run)
             if existing is None and original_run not in self._warned_runs:
                 print(f"  [WARNING] Creating run mapping from metadata (not seen in runs/): {original_run}")
                 self._warned_runs.add(original_run)
-            data["runtag"] = self.mapping.get_or_create_run(original_run)
+            anon_run = self.mapping.get_or_create_run(original_run)
+            data["runtag"] = anon_run
+
+        # Store run->team relationship for later lookups (e.g., info command)
+        if original_run and original_org:
+            self.mapping.store_run_team(original_run, original_org, anon_run, anon_org)
 
         # Check for email field
         if "email" in data and data["email"]:
@@ -624,7 +634,7 @@ class MetadataTransformer:
         """Transform a Metadata JSONL file."""
         output_path.parent.mkdir(parents=True, exist_ok=True)
         count = 0
-        with open(input_path, "r") as fin, open(output_path, "w") as fout:
+        with open(input_path, "rt", encoding="utf-8") as fin, open(output_path, "wt", encoding="utf-8") as fout:
             for line_num, line in enumerate(fin, 1):
                 line = line.strip()
                 if not line:
@@ -668,13 +678,13 @@ class TsvTransformer:
         """
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        with open(input_path, "r") as fin:
+        with open(input_path, "rt", encoding="utf-8") as fin:
             lines = fin.readlines()
 
         count = 0
         unknown_run_ids: List[str] = []
 
-        with open(output_path, "w") as fout:
+        with open(output_path, "wt", encoding="utf-8") as fout:
             for line in lines:
                 stripped = line.strip()
                 if not stripped or stripped.startswith("#"):

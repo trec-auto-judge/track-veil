@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
+from .decisions import DecisionsStore
 from .mapping import MappingStore
 from .repairs import RepairStore
 from .errors import ErrorCollector, EmailAction
@@ -47,6 +48,10 @@ class PipelineConfig:
 
     # TSV format overrides: {file_pattern: TsvFormat}
     tsv_formats: Dict[str, TsvFormat] = field(default_factory=dict)
+
+    # Decisions save/load for reproducible runs
+    save_decisions: Optional[Path] = None  # Save decisions to this file after run
+    load_decisions: Optional[Path] = None  # Load decisions from this file (skip prompts)
 
 
 @dataclass
@@ -105,6 +110,15 @@ class AnonymizationPipeline:
         self.repairs = RepairStore(config.mapping_db)
         self.errors = ErrorCollector()
 
+        # Decisions store for reproducible runs
+        if config.load_decisions:
+            self.decisions = DecisionsStore.load(config.load_decisions)
+            print(f"Loaded decisions from {config.load_decisions}")
+            # Pre-populate caches from loaded decisions
+            self._populate_caches_from_decisions()
+        else:
+            self.decisions = DecisionsStore()
+
         # Initialize transformers with email handler callback
         self.report_transformer = ReportTransformer(
             self.mapping,
@@ -138,22 +152,93 @@ class AnonymizationPipeline:
                 pass
             print("Invalid choice, try again.")
 
+    def _populate_caches_from_decisions(self) -> None:
+        """Populate internal caches from loaded decisions."""
+        # Note: We use task names as keys in decisions, but Paths in caches.
+        # The caches will be populated lazily when we encounter each task dir.
+        # Here we just pre-populate the email policy cache which uses string keys.
+        for task_name, policies in self.decisions.email_policies.items():
+            for field_path, action_str in policies.items():
+                from .errors import EmailAction
+                cache_key = (task_name, field_path)
+                self._email_policy_cache[cache_key] = EmailAction(action_str)
+
+    def _save_decisions_from_caches(self) -> None:
+        """Save internal caches to decisions store."""
+        input_dir = self.config.input_dir
+
+        # Save runs format decisions
+        for task_path, (fmt, run_cols, team_cols, has_header) in self._task_format_cache.items():
+            # Extract task name from path (relative to runs dir)
+            try:
+                rel = task_path.relative_to(input_dir / self.config.runs_dir)
+                task_name = str(rel)
+            except ValueError:
+                # May be an eval path - try eval dir
+                try:
+                    rel = task_path.relative_to(input_dir / self.config.eval_dir)
+                    task_name = str(rel)
+                    # This is an eval format, handle separately
+                    filename_pattern = self._eval_filename_cache.get(task_path)
+                    self.decisions.set_eval_format(
+                        task_name, fmt, run_cols, team_cols, has_header, filename_pattern
+                    )
+                    continue
+                except ValueError:
+                    task_name = task_path.name
+            self.decisions.set_runs_format(task_name, fmt, run_cols, team_cols, has_header)
+
+        # Save eval format decisions (those not already saved above)
+        for task_path, filename_pattern in self._eval_filename_cache.items():
+            try:
+                rel = task_path.relative_to(input_dir / self.config.eval_dir)
+                task_name = str(rel)
+            except ValueError:
+                task_name = task_path.name
+
+            if task_name not in self.decisions.eval_formats:
+                # Get format from task_format_cache if available
+                if task_path in self._task_format_cache:
+                    fmt, run_cols, team_cols, has_header = self._task_format_cache[task_path]
+                    self.decisions.set_eval_format(
+                        task_name, fmt, run_cols, team_cols, has_header, filename_pattern
+                    )
+
+        # Save email policies (already in correct format)
+        for (task_name, field_path), action in self._email_policy_cache.items():
+            self.decisions.set_email_policy(task_name, field_path, action)
+
     def _ask_tsv_format(
         self,
         file_path: Path,
         hint: TsvFormatHint,
         sample_lines: List[str] = None,
+        is_eval: bool = False,
     ) -> Tuple[TsvFormat, List[int], List[int], bool]:
         """Ask user to confirm TSV format.
 
         Returns:
             Tuple of (format, run_id_columns, team_columns, has_header)
         """
+        task_name = file_path.parent.name
+
+        # Check loaded decisions first
+        if is_eval:
+            decision = self.decisions.get_eval_format(task_name)
+            if decision:
+                fmt, run_cols, team_cols, has_header, _ = decision
+                print(f"  Using loaded decision for eval/{task_name}: {fmt.value}")
+                return fmt, run_cols, team_cols, has_header
+        else:
+            decision = self.decisions.get_runs_format(task_name)
+            if decision:
+                fmt, run_cols, team_cols, has_header = decision
+                print(f"  Using loaded decision for runs/{task_name}: {fmt.value}")
+                return fmt, run_cols, team_cols, has_header
+
         if not self.config.interactive:
             # Use hint (no team columns for predefined formats, no header skip)
             return hint.likely_format, hint.run_id_columns, [], False
-
-        task_name = file_path.parent.name
         print(f"\nDetected TSV format:")
         print(f"  Task: {task_name}")
         print(f"  File: {file_path}")
@@ -258,6 +343,15 @@ class AnonymizationPipeline:
             - "MANUAL" marker to indicate run_id should be entered per file
             - "SKIP" marker to skip the entire task
         """
+        task_name = task_dir.name
+
+        # Check loaded decisions first
+        decision = self.decisions.get_eval_format(task_name)
+        if decision and decision[4] is not None:  # filename_pattern is at index 4
+            pattern = decision[4]
+            print(f"  Using loaded filename pattern for eval/{task_name}: '{pattern}'")
+            return pattern
+
         if not self.config.interactive:
             # Non-interactive: try to detect common patterns
             return self._detect_judge_suffix(sample_file.name)
@@ -296,14 +390,26 @@ class AnonymizationPipeline:
 
         return "SKIP"
 
-    def _ask_manual_run_id(self, filename: str) -> Optional[str]:
+    def _ask_manual_run_id(self, filename: str, task_name: str = "") -> Optional[str]:
         """Ask user to enter run_id for a specific file.
 
         Returns run_id or None to skip the file.
         """
+        # Check loaded decisions first
+        if task_name:
+            loaded_run_id = self.decisions.get_manual_run_id(task_name, filename)
+            if loaded_run_id is not None:
+                print(f"  Using loaded run_id for {filename}: '{loaded_run_id}'")
+                return loaded_run_id
+
         print(f"\nEnter run_id for file: {filename}")
         print(f"  (or press Enter to skip this file)")
         run_id = input("run_id: ").strip()
+
+        # Save decision for replay
+        if run_id and task_name:
+            self.decisions.set_manual_run_id(task_name, filename, run_id)
+
         return run_id if run_id else None
 
     def _get_filename_suffix(self, filename: str, run_id: str) -> str:
@@ -328,7 +434,7 @@ class AnonymizationPipeline:
         output_file.parent.mkdir(parents=True, exist_ok=True)
         lines_processed = 0
 
-        with open(input_file, "r") as f_in, open(output_file, "w") as f_out:
+        with open(input_file, "rt", encoding="utf-8") as f_in, open(output_file, "wt", encoding="utf-8") as f_out:
             for line in f_in:
                 lines_processed += 1
                 stripped = line.rstrip("\n\r")
@@ -477,7 +583,7 @@ class AnonymizationPipeline:
                     continue
 
                 try:
-                    with open(meta_file, "r") as f:
+                    with open(meta_file, "rt", encoding="utf-8") as f:
                         for line in f:
                             line = line.strip()
                             if not line:
@@ -576,6 +682,12 @@ class AnonymizationPipeline:
         ])
         self.stats.warnings = len(self.errors.issues) - self.stats.errors
 
+        # Save decisions if requested
+        if self.config.save_decisions:
+            self._save_decisions_from_caches()
+            self.decisions.save(self.config.save_decisions)
+            print(f"\nSaved decisions to {self.config.save_decisions}")
+
         return self.stats
 
     def _detect_file_format(self, file_path: Path) -> str:
@@ -584,7 +696,7 @@ class AnonymizationPipeline:
         Returns: "jsonl" or "tsv"
         """
         import json
-        with open(file_path, "r") as f:
+        with open(file_path, "rt", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line or line.startswith("#"):
@@ -639,7 +751,7 @@ class AnonymizationPipeline:
                 task_format = self._detect_file_format(run_file)
                 if task_format == "tsv":
                     # Detect TSV format and get run_id/team columns
-                    with open(run_file, "r") as f:
+                    with open(run_file, "rt", encoding="utf-8") as f:
                         sample_lines = f.readlines()[:20]
                     hint = detect_tsv_format(sample_lines)
                     fmt, task_run_cols, task_team_cols, task_has_header = self._ask_tsv_format(
@@ -759,7 +871,7 @@ class AnonymizationPipeline:
         first_data_line = True
         team_cols = team_cols or []
 
-        with open(input_path, "r") as fin, open(output_path, "w") as fout:
+        with open(input_path, "rt", encoding="utf-8") as fin, open(output_path, "wt", encoding="utf-8") as fout:
             for line in fin:
                 stripped = line.strip()
                 if not stripped or stripped.startswith("#"):
@@ -831,7 +943,7 @@ class AnonymizationPipeline:
         count = 0
         first_data_line = True
 
-        with open(input_path, "r") as fin, open(output_path, "w") as fout:
+        with open(input_path, "rt", encoding="utf-8") as fin, open(output_path, "wt", encoding="utf-8") as fout:
             for line in fin:
                 stripped = line.strip()
 
@@ -912,7 +1024,7 @@ class AnonymizationPipeline:
                 fmt, run_id_cols, team_cols, has_header = self._task_format_cache[task_dir]
             else:
                 # Detect format for first file in this task
-                with open(eval_file, "r") as f:
+                with open(eval_file, "rt", encoding="utf-8") as f:
                     sample_lines = f.readlines()[:20]
 
                 hint = detect_tsv_format(sample_lines)
@@ -925,7 +1037,9 @@ class AnonymizationPipeline:
                     team_cols = []
                     has_header = False
                 else:
-                    fmt, run_id_cols, team_cols, has_header = self._ask_tsv_format(eval_file, hint, sample_lines)
+                    fmt, run_id_cols, team_cols, has_header = self._ask_tsv_format(
+                        eval_file, hint, sample_lines, is_eval=True
+                    )
 
                 # Cache format for this task directory (even if no run_id columns, like trec_eval)
                 if fmt != TsvFormat.UNKNOWN:
@@ -962,7 +1076,7 @@ class AnonymizationPipeline:
             # Extract run_id from filename
             if judge_suffix == "MANUAL":
                 # Ask user for run_id per file
-                extracted_run_id = self._ask_manual_run_id(eval_file.name)
+                extracted_run_id = self._ask_manual_run_id(eval_file.name, task_dir.name)
                 if extracted_run_id is None:
                     print(f"  [skip] {rel_path} (no run_id provided)")
                     continue
@@ -1099,7 +1213,7 @@ class AnonymizationPipeline:
                     lines_written = 0
                     lines_filtered = 0
 
-                    with open(meta_file, "r") as fin, open(output_file, "w") as fout:
+                    with open(meta_file, "rt", encoding="utf-8") as fin, open(output_file, "wt", encoding="utf-8") as fout:
                         for line_num, line in enumerate(fin, 1):
                             line = line.strip()
                             if not line:

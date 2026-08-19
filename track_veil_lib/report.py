@@ -229,7 +229,7 @@ class Report(BaseModel):
      
 def load_report(reports_path:Path)->List[Report]:
     reports = list()
-    with open(file=reports_path) as f:
+    with open(file=reports_path, mode="rt", encoding="utf-8") as f:
         for line in f.readlines():
             data = json.load(fp=StringIO(line))
             report = Report.validate(data)
