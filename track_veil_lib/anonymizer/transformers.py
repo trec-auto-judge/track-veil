@@ -16,7 +16,8 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 from .mapping import MappingStore, compute_report_fingerprint
 from .repairs import RepairRule, RepairStore, suggest_repair_options
 from .errors import ErrorCollector, IssueType, EmailAction
-from ..report import Report
+from autojudge_base.report import Report
+
 
 # Type alias for email handler callback
 # Signature: (task: str, field_path: str, email: str, file_path: Path) -> EmailAction
@@ -359,7 +360,9 @@ class ReportTransformer:
             # Always drop creator field (contains identifying info)
             if "creator" in meta:
                 del meta["creator"]
-
+            if "run_desc" in meta:
+                meta["run_desc"] = "[REDACTED]"
+                
             # Get team_id early for team-scoped repair rules
             current_team = meta.get("team_id", "")
 
@@ -623,6 +626,12 @@ class MetadataTransformer:
                 data["email"] = "[REDACTED]"
             elif action == EmailAction.DROP_FIELD:
                 del data["email"]
+
+        if "std-desc" in data and data["std-desc"] and anon_run is not None and original_run is not None:
+            run_desc = data["std-desc"]
+            redacted_desc = re.sub(re.escape(original_run), anon_run, run_desc, flags=re.IGNORECASE) 
+            data["std-desc"] = redacted_desc
+
 
         return json.dumps(data, separators=(",", ":"))
 

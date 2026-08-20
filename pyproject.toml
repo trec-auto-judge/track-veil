@@ -34,9 +34,32 @@ dependencies = [
 test = [
     "pytest>=8.0,<9",
 ]
+# Corpus archive builders (track-veil-docs build-corpus ...)
+duckdb = [
+    "duckdb",
+]
+routir = [
+    "routir",
+]
+
+# DEV ONLY - resolve autojudge-base from the sibling checkout instead of PyPI.
+#
+# Needed while track-veil depends on unreleased autojudge-base changes (e.g.
+# Leaderboard.write(format="jsonl")). Without this, `uv run` re-syncs from
+# uv.lock and silently replaces any manual `uv pip install -e` with the PyPI
+# wheel - and because the local version is also 0.4.5, uv treats the requirement
+# as already satisfied and the editable install appears to do nothing.
+#
+# REMOVE (or repoint) BEFORE RELEASE, once the required autojudge-base is
+# published and `dependencies` names that version. Assumes track-veil and
+# auto-judge-code-test are siblings. Ignored when track-veil is consumed as a
+# dependency, so it cannot leak into a published artifact.
+[tool.uv.sources]
+autojudge-base = { path = "../auto-judge-code-test/auto-judge-base", editable = true }
 
 [project.scripts]
 track-veil = "track_veil_lib.anonymizer.cli:main"
+track-veil-docs = "track_veil_lib.documents.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/trec-auto-judge/track_veil"

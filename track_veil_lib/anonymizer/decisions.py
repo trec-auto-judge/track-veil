@@ -4,17 +4,25 @@ Decisions file format (YAML):
     version: 1
     runs_formats:
       task_name:
+        file_type: "tsv"
         format: "ranking"
         run_id_cols: [5]
         team_cols: []
         has_header: false
     eval_formats:
       task_name:
+        file_type: "tsv"
         format: "trec_eval"
         run_id_cols: []
         team_cols: []
         has_header: false
         filename_pattern: ".qrel_eval"
+      jsonl_task_name:
+        file_type: "jsonl"        # no TSV column layout; `format` is omitted
+        filename_pattern: ".official.eval.jsonl"
+
+All files in one task directory share a file_type, so it is detected once per
+directory and replayed from here on the next run.
     manual_run_ids:
       task_name:
         "filename.txt": "run_id_value"
@@ -38,20 +46,21 @@ DECISIONS_VERSION = 1
 
 @dataclass
 class FormatDecision:
-    """Stored decision for a TSV format."""
-    format: str  # TsvFormat value
-    run_id_cols: List[int]
-    team_cols: List[int]
-    has_header: bool
+    """Stored decision for one task directory's file format."""
+    format: Optional[str] = None  # TsvFormat value; None when the directory is not TSV
+    run_id_cols: List[int] = field(default_factory=list)
+    team_cols: List[int] = field(default_factory=list)
+    has_header: bool = False
     filename_pattern: Optional[str] = None  # For eval files only
+    file_type: str = "tsv"  # "tsv" or "jsonl", detected once per directory
 
     def to_dict(self) -> Dict[str, Any]:
-        d = {
-            "format": self.format,
-            "run_id_cols": self.run_id_cols,
-            "team_cols": self.team_cols,
-            "has_header": self.has_header,
-        }
+        d: Dict[str, Any] = {"file_type": self.file_type}
+        if self.format is not None:
+            d["format"] = self.format
+            d["run_id_cols"] = self.run_id_cols
+            d["team_cols"] = self.team_cols
+            d["has_header"] = self.has_header
         if self.filename_pattern is not None:
             d["filename_pattern"] = self.filename_pattern
         return d
@@ -59,11 +68,12 @@ class FormatDecision:
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "FormatDecision":
         return cls(
-            format=d["format"],
+            format=d.get("format"),
             run_id_cols=d.get("run_id_cols", []),
             team_cols=d.get("team_cols", []),
             has_header=d.get("has_header", False),
             filename_pattern=d.get("filename_pattern"),
+            file_type=d.get("file_type", "tsv"),
         )
 
 
@@ -132,26 +142,30 @@ class DecisionsStore:
     def set_runs_format(
         self,
         task_name: str,
-        fmt: TsvFormat,
+        fmt: Optional[TsvFormat],
         run_id_cols: List[int],
         team_cols: List[int],
         has_header: bool,
+        file_type: str = "tsv",
     ) -> None:
-        """Record a runs format decision."""
+        """Record a runs format decision. `fmt` is None for non-TSV directories."""
         self.runs_formats[task_name] = FormatDecision(
-            format=fmt.value,
+            format=fmt.value if fmt is not None else None,
             run_id_cols=run_id_cols,
             team_cols=team_cols,
             has_header=has_header,
+            file_type=file_type,
         )
 
     def get_runs_format(
         self, task_name: str
     ) -> Optional[Tuple[TsvFormat, List[int], List[int], bool]]:
-        """Get stored runs format decision."""
+        """Get stored runs TSV format decision, or None if there is no TSV layout."""
         if task_name not in self.runs_formats:
             return None
         fd = self.runs_formats[task_name]
+        if fd.format is None:
+            return None
         return (
             TsvFormat(fd.format),
             fd.run_id_cols,
@@ -162,28 +176,32 @@ class DecisionsStore:
     def set_eval_format(
         self,
         task_name: str,
-        fmt: TsvFormat,
+        fmt: Optional[TsvFormat],
         run_id_cols: List[int],
         team_cols: List[int],
         has_header: bool,
         filename_pattern: Optional[str] = None,
+        file_type: str = "tsv",
     ) -> None:
-        """Record an eval format decision."""
+        """Record an eval format decision. `fmt` is None for non-TSV directories."""
         self.eval_formats[task_name] = FormatDecision(
-            format=fmt.value,
+            format=fmt.value if fmt is not None else None,
             run_id_cols=run_id_cols,
             team_cols=team_cols,
             has_header=has_header,
             filename_pattern=filename_pattern,
+            file_type=file_type,
         )
 
     def get_eval_format(
         self, task_name: str
     ) -> Optional[Tuple[TsvFormat, List[int], List[int], bool, Optional[str]]]:
-        """Get stored eval format decision."""
+        """Get stored eval TSV format decision, or None if there is no TSV layout."""
         if task_name not in self.eval_formats:
             return None
         fd = self.eval_formats[task_name]
+        if fd.format is None:
+            return None
         return (
             TsvFormat(fd.format),
             fd.run_id_cols,
@@ -191,6 +209,25 @@ class DecisionsStore:
             fd.has_header,
             fd.filename_pattern,
         )
+
+    def get_eval_filename_pattern(self, task_name: str) -> Optional[str]:
+        """Get the stored eval filename pattern, independent of the TSV layout.
+
+        Kept separate from get_eval_format so JSONL directories -- which have no
+        TSV layout -- still replay their filename pattern.
+        """
+        fd = self.eval_formats.get(task_name)
+        return fd.filename_pattern if fd else None
+
+    def get_eval_file_type(self, task_name: str) -> Optional[str]:
+        """Get the stored file type ("tsv"/"jsonl") for an eval task directory."""
+        fd = self.eval_formats.get(task_name)
+        return fd.file_type if fd else None
+
+    def get_runs_file_type(self, task_name: str) -> Optional[str]:
+        """Get the stored file type ("tsv"/"jsonl") for a runs task directory."""
+        fd = self.runs_formats.get(task_name)
+        return fd.file_type if fd else None
 
     def set_manual_run_id(self, task_name: str, filename: str, run_id: str) -> None:
         """Record a manual run_id extraction."""

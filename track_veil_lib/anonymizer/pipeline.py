@@ -3,19 +3,21 @@
 Directory structure expected:
     {input}/
         runs/{task}/{run_id}        # Report JSONL
-        eval/{task}/{run_id}.{judge} # TSV eval results
+        eval/{task}/{run_id}.{judge} # TSV or JSONL eval results
+                                     # (one file type per task directory)
         metadata/{task}/*.jl        # Metadata JSONL
 """
 
+import json
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .decisions import DecisionsStore
 from .mapping import MappingStore
 from .repairs import RepairStore
-from .errors import ErrorCollector, EmailAction
+from .errors import ErrorCollector, EmailAction, IssueType
 from .transformers import (
     ReportTransformer,
     MetadataTransformer,
@@ -99,6 +101,10 @@ class AnonymizationPipeline:
         # e.g., ".qrel_eval", ".nist-edit", or None if filenames don't follow {run_id}.{judge}
         self._eval_filename_cache: Dict[Path, Optional[str]] = {}
 
+        # File type cache: {task_dir -> "jsonl" | "tsv"}
+        # All files in a task directory share one file type; detected on the first file
+        self._task_filetype_cache: Dict[Path, str] = {}
+
         # Email policy cache: {(task, field_path) -> EmailAction}
         # Stores decisions for "redact_all" per task+field combination
         self._email_policy_cache: Dict[Tuple[str, str], EmailAction] = {}
@@ -163,46 +169,58 @@ class AnonymizationPipeline:
                 cache_key = (task_name, field_path)
                 self._email_policy_cache[cache_key] = EmailAction(action_str)
 
+    def _task_key(self, task_path: Path) -> str:
+        """Decisions-file key for a task directory.
+
+        Only the flat `runs/{task}/` and `eval/{task}/` layouts are supported, so
+        the directory name is the key. Single source of truth: readers and writers
+        of the decisions store must both go through this.
+        """
+        return task_path.name
+
+    def _classify_task_path(self, task_path: Path) -> str:
+        """Return "runs" or "eval" for a cached task directory (defaults to "runs")."""
+        input_dir = self.config.input_dir
+        try:
+            task_path.relative_to(input_dir / self.config.eval_dir)
+            return "eval"
+        except ValueError:
+            return "runs"
+
+    def _record_task_decision(
+        self,
+        task_path: Path,
+        fmt: Optional[TsvFormat],
+        run_cols: List[int],
+        team_cols: List[int],
+        has_header: bool,
+    ) -> None:
+        """Record one task directory's format decision under its decisions key."""
+        task_name = self._task_key(task_path)
+        file_type = self._task_filetype_cache.get(task_path, "tsv")
+
+        if self._classify_task_path(task_path) == "eval":
+            self.decisions.set_eval_format(
+                task_name, fmt, run_cols, team_cols, has_header,
+                self._eval_filename_cache.get(task_path), file_type,
+            )
+        else:
+            self.decisions.set_runs_format(
+                task_name, fmt, run_cols, team_cols, has_header, file_type
+            )
+
     def _save_decisions_from_caches(self) -> None:
         """Save internal caches to decisions store."""
-        input_dir = self.config.input_dir
-
-        # Save runs format decisions
+        # Task directories with a confirmed TSV layout
         for task_path, (fmt, run_cols, team_cols, has_header) in self._task_format_cache.items():
-            # Extract task name from path (relative to runs dir)
-            try:
-                rel = task_path.relative_to(input_dir / self.config.runs_dir)
-                task_name = str(rel)
-            except ValueError:
-                # May be an eval path - try eval dir
-                try:
-                    rel = task_path.relative_to(input_dir / self.config.eval_dir)
-                    task_name = str(rel)
-                    # This is an eval format, handle separately
-                    filename_pattern = self._eval_filename_cache.get(task_path)
-                    self.decisions.set_eval_format(
-                        task_name, fmt, run_cols, team_cols, has_header, filename_pattern
-                    )
-                    continue
-                except ValueError:
-                    task_name = task_path.name
-            self.decisions.set_runs_format(task_name, fmt, run_cols, team_cols, has_header)
+            self._record_task_decision(task_path, fmt, run_cols, team_cols, has_header)
 
-        # Save eval format decisions (those not already saved above)
-        for task_path, filename_pattern in self._eval_filename_cache.items():
-            try:
-                rel = task_path.relative_to(input_dir / self.config.eval_dir)
-                task_name = str(rel)
-            except ValueError:
-                task_name = task_path.name
-
-            if task_name not in self.decisions.eval_formats:
-                # Get format from task_format_cache if available
-                if task_path in self._task_format_cache:
-                    fmt, run_cols, team_cols, has_header = self._task_format_cache[task_path]
-                    self.decisions.set_eval_format(
-                        task_name, fmt, run_cols, team_cols, has_header, filename_pattern
-                    )
+        # Task directories with no TSV layout (e.g. JSONL) still carry a file type
+        # and possibly an eval filename pattern, both worth replaying.
+        for task_path in set(self._task_filetype_cache) | set(self._eval_filename_cache):
+            if task_path in self._task_format_cache:
+                continue
+            self._record_task_decision(task_path, None, [], [], False)
 
         # Save email policies (already in correct format)
         for (task_name, field_path), action in self._email_policy_cache.items():
@@ -220,7 +238,7 @@ class AnonymizationPipeline:
         Returns:
             Tuple of (format, run_id_columns, team_columns, has_header)
         """
-        task_name = file_path.parent.name
+        task_name = self._task_key(file_path.parent)
 
         # Check loaded decisions first
         if is_eval:
@@ -343,12 +361,12 @@ class AnonymizationPipeline:
             - "MANUAL" marker to indicate run_id should be entered per file
             - "SKIP" marker to skip the entire task
         """
-        task_name = task_dir.name
+        task_name = self._task_key(task_dir)
 
-        # Check loaded decisions first
-        decision = self.decisions.get_eval_format(task_name)
-        if decision and decision[4] is not None:  # filename_pattern is at index 4
-            pattern = decision[4]
+        # Check loaded decisions first. Read the pattern directly rather than via
+        # get_eval_format, which returns None for directories with no TSV layout.
+        pattern = self.decisions.get_eval_filename_pattern(task_name)
+        if pattern is not None:
             print(f"  Using loaded filename pattern for eval/{task_name}: '{pattern}'")
             return pattern
 
@@ -486,7 +504,13 @@ class AnonymizationPipeline:
             The run_id (e.g., "aa.bb.cc") or None if can't extract
         """
         if judge_suffix is None:
-            return None
+            return filename
+
+        # An empty suffix means the filename is exactly the run_id. Special-cased
+        # because filename[:-0] is "" - it trims the whole string, not nothing -
+        # which would silently turn every such file into "can't extract run_id".
+        if judge_suffix == "":
+            return filename
 
         if not filename.endswith(judge_suffix):
             return None
@@ -749,6 +773,7 @@ class AnonymizationPipeline:
             # Detect format on first file
             if task_format is None:
                 task_format = self._detect_file_format(run_file)
+                self._task_filetype_cache[task_dir] = task_format
                 if task_format == "tsv":
                     # Detect TSV format and get run_id/team columns
                     with open(run_file, "rt", encoding="utf-8") as f:
@@ -756,6 +781,10 @@ class AnonymizationPipeline:
                     hint = detect_tsv_format(sample_lines)
                     fmt, task_run_cols, task_team_cols, task_has_header = self._ask_tsv_format(
                         run_file, hint, sample_lines
+                    )
+                    # Cache so the decision is saved and replayed (incl. UNKNOWN/skip)
+                    self._task_format_cache[task_dir] = (
+                        fmt, task_run_cols, task_team_cols, task_has_header
                     )
                     if fmt != TsvFormat.UNKNOWN:
                         print(f"  (Detected {fmt.value} format for runs in {task_dir.name}/)")
@@ -798,8 +827,78 @@ class AnonymizationPipeline:
                 # This shouldn't happen since we just created the mapping above
                 print(f"  {rel_path}")
 
+    # Field names carrying a run identifier / team name in eval JSONL records
+    _JSONL_RUN_ID_FIELDS = ("run_id", "runid", "runtag")
+    _JSONL_TEAM_FIELDS = ("team_id", "team", "org")
+
+    def _anonymize_json_ids(self, node: Any, replacement_run_id: str) -> None:
+        """Rewrite run_id/team fields in a parsed JSON record, in place.
+
+        Run identifiers are set to the filename-derived anonymized run_id, since
+        for eval files the filename is the source of truth (same rule as the TSV
+        path). Team names are looked up in the mapping and left untouched when
+        unknown - eval processing is strictly lookup-only and must never create
+        a new mapping.
+        """
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key in self._JSONL_RUN_ID_FIELDS and isinstance(value, str):
+                    node[key] = replacement_run_id
+                elif key in self._JSONL_TEAM_FIELDS and isinstance(value, str):
+                    anon_team = self.mapping.get_team(value)
+                    if anon_team:
+                        node[key] = anon_team
+                else:
+                    self._anonymize_json_ids(value, replacement_run_id)
+        elif isinstance(node, list):
+            for item in node:
+                self._anonymize_json_ids(item, replacement_run_id)
+
+    def _copy_jsonl_with_anon_ids(
+        self,
+        input_path: Path,
+        output_path: Path,
+        replacement_run_id: str,
+    ) -> int:
+        """Copy an eval JSONL file, anonymizing run_id and team fields.
+
+        Returns the number of JSON records processed. Lines that do not parse are
+        copied through unchanged and recorded as parse errors.
+        """
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        count = 0
+
+        with open(input_path, "rt", encoding="utf-8") as fin, \
+                open(output_path, "wt", encoding="utf-8") as fout:
+            for line_number, line in enumerate(fin, start=1):
+                stripped = line.strip()
+
+                # Pass through empty lines and comments
+                if not stripped or stripped.startswith("#"):
+                    fout.write(line)
+                    continue
+
+                try:
+                    data = json.loads(stripped)
+                except json.JSONDecodeError as e:
+                    self.errors.add_issue(
+                        IssueType.PARSE_ERROR,
+                        input_path,
+                        line_number,
+                        None,
+                        f"Could not parse eval JSONL line, copied unchanged: {e}",
+                    )
+                    fout.write(line)
+                    continue
+
+                self._anonymize_json_ids(data, replacement_run_id)
+                fout.write(json.dumps(data, separators=(",", ":")) + "\n")
+                count += 1
+
+        return count
+
     def _process_eval(self, input_dir: Path, output_dir: Path):
-        """Process eval/ directory (TSV files)."""
+        """Process eval/ directory (TSV or JSONL files, detected per task)."""
         print(f"\nProcessing eval: {input_dir}")
 
         for task_dir in input_dir.iterdir():
@@ -807,6 +906,54 @@ class AnonymizationPipeline:
                 continue
 
             self._process_eval_task(task_dir, input_dir, output_dir)
+
+    def _eval_file_type(self, task_dir: Path, sample_file: Path) -> str:
+        """Determine the file type ("jsonl"/"tsv") for an eval task directory.
+
+        All files in one task directory share a type, so this is detected once on
+        the first file and cached; a loaded decision wins over detection.
+        """
+        if task_dir in self._task_filetype_cache:
+            return self._task_filetype_cache[task_dir]
+
+        task_name = self._task_key(task_dir)
+        stored = self.decisions.get_eval_file_type(task_name)
+        if stored is not None:
+            print(f"  Using loaded file type for eval/{task_name}: {stored}")
+            file_type = stored
+        else:
+            file_type = self._detect_file_format(sample_file)
+
+        self._task_filetype_cache[task_dir] = file_type
+        return file_type
+
+    def _resolve_eval_anon_run(
+        self,
+        eval_file: Path,
+        rel_path: Path,
+        extracted_run_id: Optional[str],
+    ) -> Optional[str]:
+        """Map a filename-derived run_id to its anonymized form (lookup only).
+
+        Returns None when the file should be skipped. May raise StopIteration
+        ("skip_task") if the user chooses to skip the whole task.
+        """
+        if extracted_run_id is None:
+            print(f"  [skip] {rel_path} (can't extract run_id from filename)")
+            return None
+
+        anon_run = self.mapping.get_run(extracted_run_id)
+        if anon_run is None:
+            print(f"  [WARNING] {rel_path}: run_id '{extracted_run_id}' not found in mapping")
+            if self.config.interactive:
+                anon_run = self._handle_unknown_eval_run_id_value(
+                    eval_file, rel_path, extracted_run_id
+                )
+            if anon_run is None:
+                print(f"  [skip] {rel_path} (unknown run_id)")
+                return None
+
+        return anon_run
 
     def _handle_unknown_eval_run_id_value(
         self,
@@ -1019,40 +1166,48 @@ class AnonymizationPipeline:
 
             rel_path = eval_file.relative_to(input_dir)
 
-            # Check if we have a cached format for this task directory
-            if task_dir in self._task_format_cache:
-                fmt, run_id_cols, team_cols, has_header = self._task_format_cache[task_dir]
-            else:
-                # Detect format for first file in this task
-                with open(eval_file, "rt", encoding="utf-8") as f:
-                    sample_lines = f.readlines()[:20]
+            # All files in a task directory share one file type - detect once
+            file_type = self._eval_file_type(task_dir, eval_file)
 
-                hint = detect_tsv_format(sample_lines)
+            fmt, run_id_cols, team_cols, has_header = TsvFormat.UNKNOWN, [], [], False
 
-                # Check for override
-                override_key = str(rel_path)
-                if override_key in self.config.tsv_formats:
-                    fmt = self.config.tsv_formats[override_key]
-                    run_id_cols = self._get_run_id_columns(fmt)
-                    team_cols = []
-                    has_header = False
+            if file_type == "tsv":
+                # Check if we have a cached format for this task directory
+                if task_dir in self._task_format_cache:
+                    fmt, run_id_cols, team_cols, has_header = self._task_format_cache[task_dir]
                 else:
-                    fmt, run_id_cols, team_cols, has_header = self._ask_tsv_format(
-                        eval_file, hint, sample_lines, is_eval=True
-                    )
+                    # Detect format for first file in this task
+                    with open(eval_file, "rt", encoding="utf-8") as f:
+                        sample_lines = f.readlines()[:20]
 
-                # Cache format for this task directory (even if no run_id columns, like trec_eval)
-                if fmt != TsvFormat.UNKNOWN:
+                    hint = detect_tsv_format(sample_lines)
+
+                    # Check for override
+                    override_key = str(rel_path)
+                    if override_key in self.config.tsv_formats:
+                        fmt = self.config.tsv_formats[override_key]
+                        run_id_cols = self._get_run_id_columns(fmt)
+                        team_cols = []
+                        has_header = False
+                    else:
+                        fmt, run_id_cols, team_cols, has_header = self._ask_tsv_format(
+                            eval_file, hint, sample_lines, is_eval=True
+                        )
+
+                    # Cache for this task directory (even if no run_id columns, like
+                    # trec_eval, and even if UNKNOWN - so a skip is asked once, saved,
+                    # and replayed rather than re-asked per file)
                     self._task_format_cache[task_dir] = (fmt, run_id_cols, team_cols, has_header)
-                    if self.config.interactive:
+                    if fmt != TsvFormat.UNKNOWN and self.config.interactive:
                         print(f"  (Using {fmt.value} format for all files in {task_dir.name}/)")
 
-            if fmt == TsvFormat.UNKNOWN:
-                print(f"  [skip] {rel_path} (unknown format)")
-                continue
+                if fmt == TsvFormat.UNKNOWN:
+                    print(f"  [skip] {rel_path} (unknown format)")
+                    continue
 
             if self.config.dry_run:
-                print(f"  [dry-run] Would process: {rel_path} as {fmt.value}")
+                as_what = fmt.value if file_type == "tsv" else file_type
+                print(f"  [dry-run] Would process: {rel_path} as {as_what}")
                 continue
 
             # Get filename pattern (judge suffix) for this task - ask once per task
@@ -1084,24 +1239,33 @@ class AnonymizationPipeline:
                 # Use judge suffix pattern
                 extracted_run_id = self._extract_run_id_from_eval_filename(eval_file.name, judge_suffix)
 
+            # JSONL eval files: rewrite run_id/team values inside the JSON
+            if file_type == "jsonl":
+                anon_run = self._resolve_eval_anon_run(eval_file, rel_path, extracted_run_id)
+                if anon_run is None:
+                    continue
+
+                temp_output = output_dir / rel_path
+                lines = self._copy_jsonl_with_anon_ids(eval_file, temp_output, anon_run)
+                self.stats.files_processed += 1
+                self.stats.lines_processed += lines
+
+                if judge_suffix == "MANUAL":
+                    file_suffix = self._get_filename_suffix(eval_file.name, extracted_run_id)
+                else:
+                    file_suffix = judge_suffix or ""
+                anon_filename = anon_run + file_suffix
+                final_output = temp_output.parent / anon_filename
+                temp_output.rename(final_output)
+                print(f"  {rel_path} -> {rel_path.parent / anon_filename}")
+                continue
+
             # For known formats without run_id columns (like trec_eval),
             # copy the file but still anonymize the filename
             if not run_id_cols:
-                if extracted_run_id is None:
-                    print(f"  [skip] {rel_path} (can't extract run_id from filename)")
-                    continue
-
-                # Look up run_id in mapping
-                anon_run = self.mapping.get_run(extracted_run_id)
+                anon_run = self._resolve_eval_anon_run(eval_file, rel_path, extracted_run_id)
                 if anon_run is None:
-                    print(f"  [WARNING] {rel_path}: run_id '{extracted_run_id}' not found in mapping")
-                    if self.config.interactive:
-                        anon_run = self._handle_unknown_eval_run_id_value(
-                            eval_file, rel_path, extracted_run_id
-                        )
-                    if anon_run is None:
-                        print(f"  [skip] {rel_path} (unknown run_id)")
-                        continue
+                    continue
 
                 temp_output = output_dir / rel_path
 
@@ -1115,7 +1279,8 @@ class AnonymizationPipeline:
                     # Derive suffix from original filename and manual run_id
                     file_suffix = self._get_filename_suffix(eval_file.name, extracted_run_id)
                 else:
-                    file_suffix = judge_suffix
+                    # None means the filename is exactly the run_id (no suffix)
+                    file_suffix = judge_suffix or ""
                 anon_filename = anon_run + file_suffix
                 final_output = temp_output.parent / anon_filename
                 temp_output.rename(final_output)
@@ -1150,6 +1315,12 @@ class AnonymizationPipeline:
                     else:
                         print(f"  {rel_path}")
                     continue
+                elif judge_suffix is None:
+                    # With no judge suffix the whole filename was *guessed* to be the
+                    # run_id. It is not in the mapping, so the guess was wrong (e.g.
+                    # "results.tsv" holding run_ids in a column) - fall through and
+                    # anonymize the run_ids found in the content instead.
+                    extracted_run_id = None
                 else:
                     print(f"  [ERROR] Filename run_id '{extracted_run_id}' not in mapping")
                     continue
@@ -1173,7 +1344,8 @@ class AnonymizationPipeline:
                     if judge_suffix == "MANUAL":
                         file_suffix = self._get_filename_suffix(eval_file.name, extracted_run_id)
                     else:
-                        file_suffix = judge_suffix
+                        # None means the filename is exactly the run_id (no suffix)
+                        file_suffix = judge_suffix or ""
                     anon_filename = anon_run + file_suffix
                     final_output = temp_output.parent / anon_filename
                     temp_output.rename(final_output)
