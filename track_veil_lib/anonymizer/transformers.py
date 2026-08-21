@@ -13,6 +13,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
+from .field_scan import REDACTED, anonymize_fields, scan_for_missed_fields
 from .mapping import MappingStore, compute_report_fingerprint
 from .repairs import RepairRule, RepairStore, suggest_repair_options
 from .errors import ErrorCollector, IssueType, EmailAction
@@ -210,6 +211,109 @@ def detect_tsv_format(lines: List[str]) -> TsvFormatHint:
     )
 
 
+def scan_for_emails(
+    obj: Any,
+    path: str,
+    file_path: Path,
+    line_num: Optional[int],
+    *,
+    errors: ErrorCollector,
+    email_handler: Optional[EmailHandler],
+    task: str = "",
+    parent: Any = None,
+    parent_key: Any = None,
+) -> bool:
+    """Recursively find email addresses by value and apply the email policy.
+
+    Addresses are matched with EMAIL_PATTERN wherever they occur, so this does not
+    depend on a field being named "email". Each one is reported, then the handler
+    decides: REDACT rewrites in place, DROP_FIELD removes the field, IGNORE leaves
+    it. The handler is where the answer is remembered per task and field.
+
+    Returns True if the field this was called on should be dropped by its parent.
+    """
+    if isinstance(obj, str):
+        for email in EMAIL_PATTERN.findall(obj):
+            errors.add_email_warning(file_path, line_num, path, email)
+
+            if email_handler and parent is not None:
+                action = email_handler(task, path, email, file_path)
+                if action == EmailAction.REDACT:
+                    parent[parent_key] = EMAIL_PATTERN.sub(REDACTED, parent[parent_key])
+                elif action == EmailAction.DROP_FIELD:
+                    return True
+        return False
+
+    if isinstance(obj, dict):
+        keys_to_drop = []
+        for key, value in obj.items():
+            if scan_for_emails(
+                value, f"{path}.{key}" if path else key, file_path, line_num,
+                errors=errors, email_handler=email_handler, task=task,
+                parent=obj, parent_key=key,
+            ):
+                keys_to_drop.append(key)
+        for key in keys_to_drop:
+            del obj[key]
+        return False
+
+    if isinstance(obj, list):
+        indices_to_drop = []
+        for index, item in enumerate(obj):
+            if scan_for_emails(
+                item, f"{path}[{index}]", file_path, line_num,
+                errors=errors, email_handler=email_handler, task=task,
+                parent=obj, parent_key=index,
+            ):
+                indices_to_drop.append(index)
+        for index in reversed(indices_to_drop):
+            del obj[index]
+        return False
+
+    return False
+
+
+def resolve_run_identity(
+    mapping: MappingStore,
+    *,
+    original_team: str,
+    content_run_id: str,
+    expected_run_id: Optional[str],
+    file_path: Path,
+    warned: set,
+) -> Tuple[str, str, str]:
+    """Apply the filename-is-source-of-truth rule and mint the pseudonyms.
+
+    The filename names the run; a differing run_id in the content is a warning
+    (once per file/content/filename combination), not an override. Records the
+    run -> team association so later sources can be cross-checked.
+
+    Returns (original_run, anon_team, anon_run); the pseudonyms are "" when there
+    was nothing to anonymize. Callers do their own field access, which is the only
+    part that differs between a dict-based and a model-based transformer.
+    """
+    if expected_run_id:
+        if content_run_id and content_run_id != expected_run_id:
+            warn_key = (file_path.name, content_run_id, expected_run_id)
+            if warn_key not in warned:
+                warned.add(warn_key)
+                print(f"  [WARNING] {file_path.name}: metadata.run_id '{content_run_id}' "
+                      f"doesn't match filename '{expected_run_id}' - using filename")
+        original_run = expected_run_id
+    else:
+        original_run = content_run_id
+
+    anon_team = mapping.get_or_create_team(original_team) if original_team else ""
+
+    anon_run = ""
+    if original_run:
+        anon_run = mapping.get_or_create_run(original_run)
+        if original_team:
+            mapping.store_run_team(original_run, original_team)
+
+    return original_run, anon_team, anon_run
+
+
 class ReportTransformer:
     """Transform Report JSONL files (runs/)."""
 
@@ -361,7 +465,7 @@ class ReportTransformer:
             if "creator" in meta:
                 del meta["creator"]
             if "run_desc" in meta:
-                meta["run_desc"] = "[REDACTED]"
+                meta["run_desc"] = REDACTED
                 
             # Get team_id early for team-scoped repair rules
             current_team = meta.get("team_id", "")
@@ -382,19 +486,10 @@ class ReportTransformer:
             original_team = current_team
             content_run_id = meta.get("run_id", "")
 
-            # Filename is the source of truth for run_id
-            # If expected_run_id (filename) is provided, use it instead of content's run_id
-            if expected_run_id:
-                if content_run_id and content_run_id != expected_run_id:
-                    # Only warn once per (file, content_run_id, expected_run_id) combination
-                    warn_key = (file_path.name, content_run_id, expected_run_id)
-                    if warn_key not in self._warned_run_mismatches:
-                        self._warned_run_mismatches.add(warn_key)
-                        print(f"  [WARNING] {file_path.name}: metadata.run_id '{content_run_id}' "
-                              f"doesn't match filename '{expected_run_id}' - using filename")
-                original_run = expected_run_id
-            else:
-                original_run = content_run_id
+            # Free text and identifying blobs named by ReportMetaData
+            if meta.get("description"):
+                meta["description"] = REDACTED
+            meta.pop("evaldata", None)
 
             # Parse into Report model to get correctly resolved topic_id and text
             try:
@@ -406,21 +501,18 @@ class ReportTransformer:
                 topic_id = ""
                 report_text = ""
 
-            # Anonymize team_id
-            anon_team = ""
-            if "team_id" in meta and meta["team_id"]:
-                anon_team = self.mapping.get_or_create_team(original_team)
+            original_run, anon_team, anon_run = resolve_run_identity(
+                self.mapping,
+                original_team=original_team,
+                content_run_id=content_run_id,
+                expected_run_id=expected_run_id,
+                file_path=file_path,
+                warned=self._warned_run_mismatches,
+            )
+            if anon_team and meta.get("team_id"):
                 meta["team_id"] = anon_team
-
-            # Anonymize run_id (use original_run which is authoritative - from filename if provided)
-            anon_run = ""
-            if original_run:
-                anon_run = self.mapping.get_or_create_run(original_run)
+            if anon_run:
                 meta["run_id"] = anon_run
-
-                # Store run→team association for cross-source consistency checks
-                if original_team:
-                    self.mapping.store_run_team(original_run, original_team)
 
             # Compute fingerprint if we have all required data
             if original_team and original_run and topic_id and report_text:
@@ -437,7 +529,71 @@ class ReportTransformer:
             # Check for email addresses
             self._scan_for_emails(meta, "metadata", file_path, line_num)
 
+        # The generic bags, whether or not the record had metadata. The declared
+        # fields are handled above and deliberately NOT passed here, so no value is
+        # anonymized twice (see field_scan, "anonymize each value exactly once").
+        #
+        # No expected_run_id: the filename names THIS run, but a run_id inside a
+        # generic bag may reference another one (a baseline, a parent run), which
+        # must keep its own identity.
+        self._clean_generic_fields(data)
+
+        # Second pass: anything identifying outside the fields ReportMetaData names
+        # is a gap in the handling above, not something to fix quietly.
+        self._report_missed_fields(data, file_path, line_num)
+
         return json.dumps(data, separators=(",", ":")), fingerprint_info
+
+
+    #: Paths this transformer owns, so the read-only second pass does not report
+    #: them back as gaps. Everything else it finds is a genuine miss.
+    HANDLED_PATHS = (
+        "metadata.team_id", "metadata.run_id", "metadata.run_desc",
+        "metadata.description", "metadata.creator", "metadata.evaldata",
+        "metadata.extra",
+    )
+
+    #: The one Dict[str, Any] bag that is kept and scanned: an open field with no
+    #: schema, so only the generic field scan can say anything about it.
+    SCANNED_BAGS = ("extra",)
+
+    #: Dict[str, Any] bags dropped outright - producer-side payload and AutoJudge's
+    #: own evaluation data, neither of which belongs in a shared dataset. Dropped
+    #: rather than scanned, so there is nothing left to anonymize.
+    DROPPED_BAGS = ("metadata", "evaldata")
+
+    def _clean_generic_fields(self, data: Dict[str, Any]) -> None:
+        """Handle the Report's Dict[str, Any] bags: drop most, scan metadata.extra.
+
+        Only open bags are passed to the field scan; everything the schema names is
+        handled in transform_line and must not be scanned as well, or it would be
+        anonymized twice.
+        """
+        meta = data.get("metadata")
+        if isinstance(meta, dict):
+            for field_name in self.SCANNED_BAGS:
+                if isinstance(meta.get(field_name), dict):
+                    anonymize_fields(meta[field_name], self.mapping)
+
+        data.pop("evaldata", None)  # report-level; metadata.evaldata is dropped above
+
+        for sentences_key in ("responses", "answer"):
+            for sentence in data.get(sentences_key) or []:
+                if isinstance(sentence, dict):
+                    for field_name in self.DROPPED_BAGS:
+                        sentence.pop(field_name, None)
+
+    def _report_missed_fields(self, data: Any, file_path: Path, line_num: int) -> None:
+        for action in scan_for_missed_fields(data, self.HANDLED_PATHS):
+            self.errors.add_issue(
+                IssueType.IDENTIFIER_FOUND,
+                file_path,
+                line_num,
+                action.path,
+                f"Identifying field '{action.key}' ({action.category.value}) found at "
+                f"{action.path}, which the Report handling does not cover",
+                original_value=action.original,
+            )
 
     def _scan_for_emails(
         self,
@@ -448,62 +604,12 @@ class ReportTransformer:
         parent: Any = None,
         parent_key: Any = None,
     ) -> bool:
-        """Recursively scan for email addresses and optionally redact/drop.
-
-        Args:
-            obj: The object to scan
-            path: JSON path for display (e.g., "metadata.creator.contact")
-            file_path: Source file for error reporting
-            line_num: Line number for error reporting
-            parent: Parent object (dict or list) for in-place modification
-            parent_key: Key or index in parent for in-place modification
-
-        Returns:
-            True if this field should be dropped from parent
-        """
-        if isinstance(obj, str):
-            emails = EMAIL_PATTERN.findall(obj)
-            for email in emails:
-                self.errors.add_email_warning(file_path, line_num, path, email)
-
-                # Check with handler if we should redact/drop
-                if self.email_handler and parent is not None:
-                    action = self.email_handler(
-                        self._current_task, path, email, file_path
-                    )
-                    if action == EmailAction.REDACT:
-                        # Redact in place
-                        redacted = EMAIL_PATTERN.sub("[REDACTED]", parent[parent_key])
-                        parent[parent_key] = redacted
-                    elif action == EmailAction.DROP_FIELD:
-                        return True  # Signal to drop this field
-            return False
-        elif isinstance(obj, dict):
-            keys_to_drop = []
-            for key, value in obj.items():
-                should_drop = self._scan_for_emails(
-                    value, f"{path}.{key}", file_path, line_num,
-                    parent=obj, parent_key=key
-                )
-                if should_drop:
-                    keys_to_drop.append(key)
-            for key in keys_to_drop:
-                del obj[key]
-            return False
-        elif isinstance(obj, list):
-            indices_to_drop = []
-            for i, item in enumerate(obj):
-                should_drop = self._scan_for_emails(
-                    item, f"{path}[{i}]", file_path, line_num,
-                    parent=obj, parent_key=i
-                )
-                if should_drop:
-                    indices_to_drop.append(i)
-            # Remove in reverse order to preserve indices
-            for i in reversed(indices_to_drop):
-                del obj[i]
-            return False
-        return False
+        """Find email addresses and apply the email policy (see scan_for_emails)."""
+        return scan_for_emails(
+            obj, path, file_path, line_num,
+            errors=self.errors, email_handler=self.email_handler,
+            task=self._current_task, parent=parent, parent_key=parent_key,
+        )
 
     def transform_file(
         self,
@@ -534,6 +640,251 @@ class ReportTransformer:
                     # Store fingerprint if available
                     if fingerprint_info:
                         self.mapping.store_fingerprint(**fingerprint_info)
+        return count
+
+
+class NuggetBankTransformer:
+    """Transform ragtime26 nugget bank JSONL files.
+
+    Works on the typed model rather than raw JSON: each line is loaded as a
+    ``Ragtime26NuggetBank`` and written back through ``write_ragtime26_nugget_banks``,
+    so the traversal is the format's own and nothing here has to know the wire shape.
+    Note the writer stamps ``format_version`` onto every line, so output is not
+    byte-identical to the submission -- the anonymized fields change anyway.
+
+    Per nugget bank:
+      - ``metadata.team_id`` and ``metadata.run_id`` are anonymized, with the filename
+        as the source of truth for run_id (as for Reports)
+      - ``metadata.run_desc`` is redacted -- it is free text naming the team's system
+      - unknown ``metadata`` keys survive (Ragtime26NuggetMetadata allows extras) but
+        are put through the generic field scan, so a team named under some other key
+        is anonymized rather than published
+      - nugget-, answer- and reference-level ``metadata`` is dropped: producer-side
+        annotation with no place in a shared dataset
+
+    Questions, answers and references themselves are left untouched.
+    """
+
+    #: The whole metadata object is handled: declared fields by _anonymize_metadata,
+    #: unknown ones by the field scan below. So the read-only second pass reports
+    #: only identifying data found OUTSIDE metadata.
+    HANDLED_PATHS = ("metadata",)
+
+    def __init__(
+        self,
+        mapping: MappingStore,
+        errors: ErrorCollector,
+        email_handler: Optional[EmailHandler] = None,
+    ):
+        self.mapping = mapping
+        self.errors = errors
+        self.email_handler = email_handler
+        self._current_task: str = ""  # Set by caller before processing
+        self._warned_run_mismatches: set = set()
+
+    def _anonymize_metadata(
+        self,
+        bank,
+        file_path: Path,
+        expected_run_id: Optional[str] = None,
+    ) -> None:
+        """Anonymize the run metadata of one nugget bank, in place."""
+        meta = bank.metadata
+
+        if meta.run_desc is not None:
+            meta.run_desc = REDACTED
+
+        _run, anon_team, anon_run = resolve_run_identity(
+            self.mapping,
+            original_team=meta.team_id or "",
+            content_run_id=meta.run_id or "",
+            expected_run_id=expected_run_id,
+            file_path=file_path,
+            warned=self._warned_run_mismatches,
+        )
+        if anon_team:
+            meta.team_id = anon_team
+        if anon_run:
+            meta.run_id = anon_run
+
+    @staticmethod
+    def _drop_annotations(bank) -> int:
+        """Drop nugget/answer/reference metadata. Returns how many were dropped.
+
+        Setting them to None is enough: the writer dumps with exclude_none, so the
+        keys disappear from the output.
+        """
+        dropped = 0
+        for nugget in bank.nuggets_as_list():
+            if nugget.metadata is not None:
+                nugget.metadata = None
+                dropped += 1
+            for answer in nugget.answers or []:
+                if answer.metadata is not None:
+                    answer.metadata = None
+                    dropped += 1
+                for reference in answer.references or []:
+                    # references are doc-id strings or Reference objects
+                    if not isinstance(reference, str) and reference.metadata is not None:
+                        reference.metadata = None
+                        dropped += 1
+        return dropped
+
+    def transform_file(
+        self,
+        input_path: Path,
+        output_path: Path,
+        expected_run_id: Optional[str] = None,
+    ) -> Tuple[int, int]:
+        """Transform a nugget bank JSONL file.
+
+        Returns (nugget_banks_written, annotations_dropped).
+        """
+        # _load_jsonl rather than load_ragtime26_nugget_banks_from_file: the public
+        # loader picks its parser from the filename, and these files are named after
+        # the run, with no .jsonl extension.
+        from autojudge_base.nugget_data import (
+            Ragtime26NuggetBank, Ragtime26NuggetBanks, Ragtime26NuggetMetadata,
+            write_ragtime26_nugget_banks,
+        )
+        from autojudge_base.nugget_data.io import _load_jsonl
+
+        try:
+            with open(input_path, "rt", encoding="utf-8") as f:
+                nugget_banks = _load_jsonl(f, Ragtime26NuggetBank, Ragtime26NuggetBanks)
+        except Exception as e:
+            self.errors.add_issue(
+                IssueType.PARSE_ERROR,
+                input_path,
+                None,
+                None,
+                f"Could not load as ragtime26 nugget banks: {e}",
+            )
+            return 0, 0
+
+        # A record with no nugget_bank key is rejected by the model itself
+        # (Ragtime26NuggetBank.nugget_bank is required), so a Report handed to this
+        # transformer fails to load rather than writing out an empty nugget bank.
+        dropped = 0
+        for bank in nugget_banks.banks.values():
+            self._anonymize_metadata(bank, input_path, expected_run_id)
+            dropped += self._drop_annotations(bank)
+
+            # The one open bag here: metadata is extra="allow", so unknown keys are
+            # preserved and nothing above has looked at them. Scan those keys only -
+            # the declared ones were handled by _anonymize_metadata and must not be
+            # anonymized twice. Nugget/answer/reference metadata needs no scan; it is
+            # dropped outright by _drop_annotations.
+            declared = set(Ragtime26NuggetMetadata.model_fields)
+            dumped = bank.metadata.model_dump(exclude_none=True)
+            unknown = {k: v for k, v in dumped.items() if k not in declared}
+
+            if unknown:
+                anonymize_fields(unknown, self.mapping)
+                scan_for_emails(
+                    unknown, "metadata", input_path, None,
+                    errors=self.errors, email_handler=self.email_handler,
+                    task=self._current_task,
+                )
+                kept = {k: v for k, v in dumped.items() if k in declared}
+                bank.metadata = Ragtime26NuggetMetadata.model_validate(
+                    {**kept, **unknown}
+                )
+            # Second pass: metadata allows unknown keys and nuggets carry free text,
+            # so anything identifying outside the three fields handled above is a gap.
+            for action in scan_for_missed_fields(
+                bank.model_dump(exclude_none=True), self.HANDLED_PATHS
+            ):
+                self.errors.add_issue(
+                    IssueType.IDENTIFIER_FOUND,
+                    input_path,
+                    None,
+                    action.path,
+                    f"Identifying field '{action.key}' ({action.category.value}) found "
+                    f"at {action.path} in topic {bank.query_id}, which the ragtime26 "
+                    f"handling does not cover",
+                    original_value=action.original,
+                )
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        write_ragtime26_nugget_banks(nugget_banks, output_path, format="jsonl")
+        return len(nugget_banks.banks), dropped
+
+
+class RawJsonlTransformer:
+    """Best-effort anonymization of a JSONL file whose format is not recognized.
+
+    The fallback for when no format could be guessed, or the typed loader refused
+    the file: rather than dropping it from the dataset, anonymize the identifying
+    fields that can be found in a top-level ``metadata`` object and pass the rest
+    through.
+
+    This is deliberately shallow. The record's structure is unknown, so identifying
+    data nested anywhere else is NOT found -- which in an anonymization tool is a
+    leak, not an inconvenience. Every file handled this way is recorded as an
+    UNKNOWN_FORMAT issue so it shows up in the error report for a human to look at.
+    """
+
+    def __init__(
+        self,
+        mapping: MappingStore,
+        errors: ErrorCollector,
+        email_handler: Optional[EmailHandler] = None,
+    ):
+        self.mapping = mapping
+        self.errors = errors
+        self.email_handler = email_handler
+        self._current_task: str = ""
+
+    def transform_file(
+        self,
+        input_path: Path,
+        output_path: Path,
+        expected_run_id: Optional[str] = None,
+    ) -> int:
+        """Anonymize what can be found in each record's metadata. Returns lines written."""
+        self.errors.add_issue(
+            IssueType.UNKNOWN_FORMAT,
+            input_path,
+            None,
+            None,
+            "Unrecognized JSONL format: anonymized the metadata fields that were "
+            "recognized and passed the rest through unexamined. Identifying data "
+            "elsewhere in these records would NOT have been removed.",
+        )
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        count = 0
+
+        with open(input_path, "rt", encoding="utf-8") as fin, \
+                open(output_path, "wt", encoding="utf-8") as fout:
+            for line_num, line in enumerate(fin, 1):
+                stripped = line.strip()
+                if not stripped:
+                    continue
+
+                try:
+                    data = json.loads(stripped)
+                except json.JSONDecodeError as e:
+                    self.errors.add_issue(
+                        IssueType.PARSE_ERROR, input_path, line_num, None,
+                        f"JSON parse error, line copied unchanged: {e}",
+                        original_value=stripped[:200],
+                    )
+                    fout.write(line)
+                    continue
+
+                # Deep scan: no schema to go by, so every level is examined
+                anonymize_fields(data, self.mapping, expected_run_id)
+                scan_for_emails(
+                    data, "", input_path, line_num,
+                    errors=self.errors, email_handler=self.email_handler,
+                    task=self._current_task,
+                )
+
+                fout.write(json.dumps(data, separators=(",", ":")) + "\n")
+                count += 1
+
         return count
 
 

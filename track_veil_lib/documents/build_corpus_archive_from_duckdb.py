@@ -24,6 +24,7 @@ CORPUS_DEFAULTS = {
     "msmarco": "/exp/scale25/rag/docs/msmarco_v2.1_doc_segmented",
     "neuclir": "/exp/scale25/neuclir/docs/mlir.mt.jsonl",
     "ragtime": "/exp/scale25/ragtime/docs/mlir.mt.jsonl",
+    "ragtime2": "./datacleaning-trec2026/ragtime/collection/*json.gz",
 }
 
 # Document ID field name varies by corpus
@@ -31,6 +32,7 @@ DOCNO_FIELDS = {
     "msmarco": "docid",
     "neuclir": "id",
     "ragtime": "id",
+    "ragtime2": "id",
 }
 
 
@@ -61,7 +63,7 @@ def get_last_docno(output_path: Path) -> str | None:
             for line in f:
                 if line.strip():
                     doc = json.loads(line)
-                    last_docno = doc.get("docno")
+                    last_docno = doc.get("docno") or doc.get("id")
     except (FileNotFoundError, EOFError):
         pass
     return last_docno
@@ -162,7 +164,8 @@ def fetch_documents_duckdb(
         # Normalize docno field
         if docno_field in doc and docno_field != "docno":
             doc["docno"] = doc[docno_field]
-        found_ids.add(doc.get("docno") or doc.get(docno_field))
+        if doc.get("docno") or doc.get(docno_field):
+            found_ids.add(doc.get("docno") or doc.get(docno_field))
         documents.append(doc)
 
     missing = set(doc_ids) - found_ids
@@ -187,7 +190,7 @@ def main():
     )
     parser.add_argument(
         "--corpus", "-c",
-        choices=["msmarco", "neuclir", "ragtime"],
+        choices=["msmarco", "neuclir", "ragtime", "ragtime2"],
         required=True,
         help="Corpus type",
     )

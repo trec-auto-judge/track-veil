@@ -11,7 +11,7 @@ import hashlib
 import sqlite3
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 from .pseudonyms import PseudonymPool
 
@@ -37,7 +37,22 @@ class MappingStore:
         store = MappingStore("mapping.db")  # loads existing seed & state
     """
 
-    def __init__(self, db_path: Path | str, seed: Optional[int] = None):
+    def __init__(
+        self,
+        db_path: Path | str,
+        seed: Optional[int] = None,
+        on_pseudonym_reuse: Optional[Callable[[str, str, str], bool]] = None,
+    ):
+        """
+        Args:
+            db_path: SQLite file holding the mappings
+            seed: pseudonym pool seed; must match the one stored in an existing DB
+            on_pseudonym_reuse: called as (kind, value, original) when asked to
+                anonymize something that is already one of our pseudonyms. Returns
+                True to anonymize anyway, False to leave the value alone. Without a
+                handler the value is left alone and a warning is printed.
+        """
+        self._on_pseudonym_reuse = on_pseudonym_reuse
         self._db_path = Path(db_path)
         self._conn = sqlite3.connect(self._db_path)
         self._conn.row_factory = sqlite3.Row
@@ -64,8 +79,6 @@ class MappingStore:
         if team_idx is not None and run_idx is not None:
             self._pool.set_indices(int(team_idx), int(run_idx))
 
-        # Track run_id → original_team for cross-source consistency checks
-        self._run_to_team: Dict[str, str] = {}
 
     def _generate_seed(self) -> int:
         """Generate a random seed for new databases."""
@@ -148,6 +161,33 @@ class MappingStore:
         )
         self._conn.commit()
 
+    def _allow_anonymizing(self, table: str, value: str, kind: str) -> bool:
+        """Whether it is safe to mint a new mapping for `value`.
+
+        get_or_create_* is not idempotent over its own output: handed one of its own
+        pseudonyms it would mint a pseudonym of the pseudonym and store a bogus
+        mapping. That only happens when already-anonymized data is fed back in --
+        typically re-running over an output directory -- so warn, and let the caller
+        decide (the handler is asked; with no handler the value is left alone).
+
+        Returns True to go ahead and anonymize, False to leave the value as it is.
+        """
+        cur = self._conn.cursor()
+        cur.execute(f"SELECT original FROM {table} WHERE anonymized = ?", (value,))
+        row = cur.fetchone()
+        if not row:
+            return True  # not one of ours - normal case
+
+        print(f"  [WARNING] {kind} {value!r} is already the pseudonym for "
+              f"{row['original']!r}. This input looks already anonymized; "
+              f"anonymizing again would map it a second time.")
+
+        if self._on_pseudonym_reuse is None:
+            print(f"           Leaving {value!r} unchanged.")
+            return False
+
+        return self._on_pseudonym_reuse(kind, value, row["original"])
+
     def get_or_create_team(self, original: str) -> str:
         """Get anonymized team name, creating mapping if needed."""
         cur = self._conn.cursor()
@@ -158,6 +198,9 @@ class MappingStore:
         row = cur.fetchone()
         if row:
             return row["anonymized"]
+
+        if not self._allow_anonymizing("team_mappings", original, "team"):
+            return original
 
         # Create new mapping, retry if collision
         while True:
@@ -185,6 +228,9 @@ class MappingStore:
         row = cur.fetchone()
         if row:
             return row["anonymized"]
+
+        if not self._allow_anonymizing(("run_mappings"), original, "run"):
+            return original
 
         # Create new mapping, retry if collision
         while True:
@@ -222,17 +268,21 @@ class MappingStore:
         row = cur.fetchone()
         return row["anonymized"] if row else None
 
-    def store_run_team(self, run_id: str, team: str):
-        """Store the association between a run_id and its original team.
-
-        Called when processing runs/ to track which team submitted each run.
-        Used later to detect mismatches when metadata has different team name.
-        """
-        self._run_to_team[run_id] = team
-
     def get_run_team(self, run_id: str) -> Optional[str]:
-        """Get the original team associated with a run_id."""
-        return self._run_to_team.get(run_id)
+        """Get the original team associated with an original run_id.
+
+        Reads the run_team_mappings table written by store_run_team. (It used to
+        read an in-memory dict fed by a second store_run_team defined further down,
+        which shadowed the one that filled it - so this always returned None and the
+        team-mismatch check that depends on it never fired.)
+        """
+        cur = self._conn.cursor()
+        cur.execute(
+            "SELECT original_team FROM run_team_mappings WHERE original_run = ?",
+            (run_id,),
+        )
+        row = cur.fetchone()
+        return row["original_team"] if row else None
 
     def get_all_team_mappings(self) -> Dict[str, str]:
         """Return all team mappings as {original: anonymized}."""

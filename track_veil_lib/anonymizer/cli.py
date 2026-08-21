@@ -154,6 +154,8 @@ def show_mapping(mapping_db: Path, output_format: str):
     """Show current anonymization mappings.
 
     Example:
+
+    \b
         trec-anon show-mapping -m mapping.db
         trec-anon show-mapping -m mapping.db -f json
     """
@@ -218,6 +220,8 @@ def reverse_lookup(mapping_db: Path, anonymized_value: str):
     """Look up the original value for an anonymized identifier.
 
     Example:
+
+    \b
         trec-anon reverse-lookup -m mapping.db Fez
         trec-anon reverse-lookup -m mapping.db Fez-07
     """
@@ -330,6 +334,8 @@ def recover_mapping(
     anonymized reports back to their original identifiers.
 
     Example:
+
+    \b
         trec-anon recover-mapping -m mapping.db -i anon_reports.jsonl
         trec-anon recover-mapping -m mapping.db -i anon_data/runs/ -f csv -o mappings.csv
     """
@@ -892,6 +898,8 @@ def select_priority(
     and copies the corresponding run files from the runs directory to the output.
 
     Example:
+
+    \b
         track-veil select-priority -m meta.jsonl -r runs/ -o prio1/ -p "1 (top)"
         track-veil select-priority -m meta.jsonl -r runs/ -o prio1/ -p "1 (highest)" --dry-run
     """
@@ -1193,6 +1201,8 @@ def ensure_topics(
     - Ranking TSV files (filters by first column)
 
     Example:
+
+    \b
         cat topics.txt | track-veil ensure-topics -r runs/ -o filtered/
         jq -r '.topic_id' requests.jsonl | track-veil ensure-topics -r runs/ -o filtered/
     """
@@ -1322,6 +1332,8 @@ def info_command(
     Reports on runs, topics, eval files, qrels, and leaderboards.
 
     Example:
+
+    \b
         track-veil info -d data/anon/
         track-veil info -d data/anon/ -m mapping.db -v
     """
@@ -1639,7 +1651,9 @@ def info_command(
     "--topic-path",
     default=None,
     type=click.Path(dir_okay=False, path_type=Path),
-    help="Path to the topic file",
+    help="Topics file to record in each dataset entry. Must sit under --data: it is "
+         "written to the yml relative to it, as the 'responses' path is. Without it, "
+         "'topics' is left as a TODO for you to fill in.",
 )
 def generate_datasets_yml(
     data_dir: Path,
@@ -1654,6 +1668,8 @@ def generate_datasets_yml(
     with one entry per task, extracting assessed_topics from qrels.
 
     Example:
+
+    \b
         track-veil generate-datasets-yml -d data/anon/
         track-veil generate-datasets-yml -d data/anon/ -o my_datasets.yml
     """
@@ -1879,6 +1895,8 @@ def random_eval(
     pseudonyms.
 
     Example:
+
+    \b
         track-veil random-eval -d data/anon/ --topics rag-topic-list.txt
     """
     import random

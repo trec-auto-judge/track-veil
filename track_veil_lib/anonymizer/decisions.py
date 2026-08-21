@@ -53,9 +53,14 @@ class FormatDecision:
     has_header: bool = False
     filename_pattern: Optional[str] = None  # For eval files only
     file_type: str = "tsv"  # "tsv" or "jsonl", detected once per directory
+    # For JSONL directories: which record type the files hold. Guessed from the
+    # data, confirmed by the user, and replayed from here on the next run.
+    content_type: Optional[str] = None  # ContentType value
 
     def to_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {"file_type": self.file_type}
+        if self.content_type is not None:
+            d["content_type"] = self.content_type
         if self.format is not None:
             d["format"] = self.format
             d["run_id_cols"] = self.run_id_cols
@@ -74,6 +79,7 @@ class FormatDecision:
             has_header=d.get("has_header", False),
             filename_pattern=d.get("filename_pattern"),
             file_type=d.get("file_type", "tsv"),
+            content_type=d.get("content_type"),
         )
 
 
@@ -228,6 +234,16 @@ class DecisionsStore:
         """Get the stored file type ("tsv"/"jsonl") for a runs task directory."""
         fd = self.runs_formats.get(task_name)
         return fd.file_type if fd else None
+
+    def set_runs_content_type(self, task_name: str, content_type: str) -> None:
+        """Record which record type a runs/ JSONL directory holds."""
+        decision = self.runs_formats.setdefault(task_name, FormatDecision(file_type="jsonl"))
+        decision.content_type = content_type
+
+    def get_runs_content_type(self, task_name: str) -> Optional[str]:
+        """Get the stored record type for a runs/ directory, if any."""
+        decision = self.runs_formats.get(task_name)
+        return decision.content_type if decision else None
 
     def set_manual_run_id(self, task_name: str, filename: str, run_id: str) -> None:
         """Record a manual run_id extraction."""

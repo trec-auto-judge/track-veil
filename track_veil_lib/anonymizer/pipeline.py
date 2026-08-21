@@ -18,7 +18,10 @@ from .decisions import DecisionsStore
 from .mapping import MappingStore
 from .repairs import RepairStore
 from .errors import ErrorCollector, EmailAction, IssueType
+from .content_type import ContentType, ContentTypeGuess, describe_guess, guess_content_type
 from .transformers import (
+    NuggetBankTransformer,
+    RawJsonlTransformer,
     ReportTransformer,
     MetadataTransformer,
     TsvTransformer,
@@ -105,6 +108,11 @@ class AnonymizationPipeline:
         # All files in a task directory share one file type; detected on the first file
         self._task_filetype_cache: Dict[Path, str] = {}
 
+        # Content type cache: {task_dir -> ContentType value}
+        # Which record a JSONL runs/ directory holds (Report vs which nugget bank),
+        # guessed from the first file and confirmed by the user
+        self._task_content_type_cache: Dict[Path, str] = {}
+
         # Email policy cache: {(task, field_path) -> EmailAction}
         # Stores decisions for "redact_all" per task+field combination
         self._email_policy_cache: Dict[Tuple[str, str], EmailAction] = {}
@@ -112,7 +120,9 @@ class AnonymizationPipeline:
         self._email_examples: Dict[Tuple[str, str], Tuple[str, str]] = {}  # -> (email, file_path)
 
         # Initialize stores
-        self.mapping = MappingStore(config.mapping_db)
+        self.mapping = MappingStore(
+            config.mapping_db, on_pseudonym_reuse=self._ask_pseudonym_reuse
+        )
         self.repairs = RepairStore(config.mapping_db)
         self.errors = ErrorCollector()
 
@@ -143,6 +153,38 @@ class AnonymizationPipeline:
             self.mapping,
             self.errors,
         )
+        self.nugget_bank_transformer = NuggetBankTransformer(
+            self.mapping,
+            self.errors,
+            email_handler=self.get_email_action,
+        )
+        self.raw_jsonl_transformer = RawJsonlTransformer(
+            self.mapping,
+            self.errors,
+            email_handler=self.get_email_action,
+        )
+
+    def _ask_pseudonym_reuse(self, kind: str, value: str, original: str) -> bool:
+        """Asked when a value to anonymize is already one of our own pseudonyms.
+
+        Means the input has been through the anonymizer before - usually re-running
+        over an output directory. Anonymizing again maps it a second time, which is
+        a bug, so the default is to leave it alone.
+        """
+        if not self.config.interactive:
+            print(f"           Leaving {value!r} unchanged (non-interactive).")
+            return False
+
+        options = [
+            (f"Leave {value!r} as it is (recommended - it is already anonymized)", False),
+            (f"Anonymize it again (maps {value!r} to a second pseudonym)", True),
+        ]
+        choice = self.ask_fn(
+            f"The {kind} {value!r} is already the pseudonym for {original!r}. "
+            f"Is this input already anonymized?",
+            options,
+        )
+        return options[choice][1]
 
     def _default_ask(self, prompt: str, options: List[Tuple[str, object]]) -> int:
         """Default interactive prompt."""
@@ -208,6 +250,9 @@ class AnonymizationPipeline:
             self.decisions.set_runs_format(
                 task_name, fmt, run_cols, team_cols, has_header, file_type
             )
+            content_type = self._task_content_type_cache.get(task_path)
+            if content_type is not None:
+                self.decisions.set_runs_content_type(task_name, content_type)
 
     def _save_decisions_from_caches(self) -> None:
         """Save internal caches to decisions store."""
@@ -348,6 +393,75 @@ class AnonymizationPipeline:
             return [5]
         else:
             return []
+
+    def _ask_content_type(self, task_dir: Path, sample_file: Path) -> str:
+        """Determine which record type a JSONL runs/ directory holds.
+
+        Peeks at the first record of the first file, guesses the format, shows the
+        user what it saw and why, and asks. The answer is cached per task directory
+        and saved to the decisions file, so a later run replays it without asking.
+        """
+        if task_dir in self._task_content_type_cache:
+            return self._task_content_type_cache[task_dir]
+
+        task_name = self._task_key(task_dir)
+
+        stored = self.decisions.get_runs_content_type(task_name)
+        if stored is not None:
+            print(f"  Using loaded content type for runs/{task_name}: {stored}")
+            self._task_content_type_cache[task_dir] = stored
+            return stored
+
+        # Peek at the first record
+        record = None
+        sample_text = ""
+        try:
+            with open(sample_file, "rt", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        sample_text = line
+                        record = json.loads(line)
+                        break
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"  [WARNING] {sample_file.name}: could not read a record ({e})")
+
+        guess = guess_content_type(record) if record is not None else ContentTypeGuess()
+
+        if not self.config.interactive:
+            content_type = guess.guess
+            print(f"  runs/{task_name}: assuming {content_type} (non-interactive)")
+            self._task_content_type_cache[task_dir] = content_type
+            return content_type
+
+        print(f"\nWhat do the files in runs/{task_name}/ hold?")
+        print(f"  File: {sample_file}")
+        if sample_text:
+            preview = sample_text if len(sample_text) <= 160 else sample_text[:157] + "..."
+            print(f"  Sample: {preview}")
+        for line in describe_guess(guess):
+            print(line)
+
+        if guess.guess == ContentType.UNKNOWN:
+            print("  No format recognized. Raw handling anonymizes only the metadata "
+                  "fields it recognizes and passes the rest through unexamined.")
+
+        options = [
+            (ContentType.LABELS[content_type], content_type)
+            for content_type in (*ContentType.ORDERED, ContentType.RAW, ContentType.UNKNOWN)
+        ]
+        # Put the guess first
+        for i, (_desc, content_type) in enumerate(options):
+            if content_type == guess.guess:
+                options.insert(0, options.pop(i))
+                break
+
+        choice = self.ask_fn("Which record type is this?", options)
+        content_type = options[choice][1]
+
+        print(f"  (Using {content_type} for all files in runs/{task_name}/)")
+        self._task_content_type_cache[task_dir] = content_type
+        return content_type
 
     def _ask_eval_filename_pattern(
         self,
@@ -796,10 +910,35 @@ class AnonymizationPipeline:
             # Process based on format
             temp_output = output_dir / rel_path
             if task_format == "jsonl":
+                # Reports and nugget banks are both JSONL, so ask which this is
+                content_type = self._ask_content_type(task_dir, run_file)
+
+                if content_type == ContentType.UNKNOWN:
+                    print(f"  [skip] {rel_path} (task skipped)")
+                    continue
+
                 # For JSONL, filename IS the run_id - verify content matches
-                lines = self.report_transformer.transform_file(
-                    run_file, temp_output, expected_run_id=run_file.name
-                )
+                if content_type == ContentType.RAGTIME26_NUGGET_BANK:
+                    lines, _dropped = self.nugget_bank_transformer.transform_file(
+                        run_file, temp_output, expected_run_id=run_file.name
+                    )
+                    if lines == 0:
+                        # The typed loader refused it; fall back rather than drop the
+                        # file from the dataset (the fallback records its own warning)
+                        print(f"  [WARNING] {rel_path}: not loadable as "
+                              f"{content_type}, falling back to raw handling")
+                        lines = self.raw_jsonl_transformer.transform_file(
+                            run_file, temp_output, expected_run_id=run_file.name
+                        )
+                elif content_type == ContentType.REPORT:
+                    lines = self.report_transformer.transform_file(
+                        run_file, temp_output, expected_run_id=run_file.name
+                    )
+                else:
+                    # RAW, or ragtime25 which has no transformer of its own yet
+                    lines = self.raw_jsonl_transformer.transform_file(
+                        run_file, temp_output, expected_run_id=run_file.name
+                    )
             else:
                 # TSV format (ranking file)
                 if task_run_cols or task_team_cols:

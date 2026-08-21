@@ -95,7 +95,7 @@ BABY_NAMES = [
     "ian", "ida", "ilan", "ilse", "ines", "irene", "irma",
     "isaac", "ivan",
 
-    "jace", "jack", "jada", "jade", "jake", "jamie", "jan", "jana",
+    "jace", "jack", "jade", "jake", "jamie", "jan", "jana",
     "jane", "janis", "jared", "jason", "jay", "jean", "jeff", "jena",
     "jenna", "jerry", "jesse", "jill", "joan", "jody", "joe", "joel",
     "joey", "john", "jolie", "jon", "jonas", "joni", "jorge", "jose",
@@ -113,7 +113,7 @@ BABY_NAMES = [
 
     "mabel", "mae", "maia", "mandy", "mara", "marc", "marco", "marcy",
     "maria", "marie", "mario", "mark", "marla", "marta", "mary", "mason",
-    "max", "maya", "megan", "meryl", "mia", "mica", "micah", "mike",
+    "max", "maya", "megan", "meryl", "mia",  "micah", "mike",
     "mila", "miles", "milo", "mimi", "mina", "mira", "moira", "molly",
 
     "nadia", "nate", "neil", "nell", "nessa", "nia", "niko", "nina",
@@ -141,7 +141,7 @@ BABY_NAMES = [
     "tim", "tina", "toby", "todd", "tom", "toni", "tony",
     "trent", "troy", "trudy",
 
-    "uma", "una",
+    "uma",
 
     "vance", "veda", "vera", "vic", "vicki", "vince", "viola",
 
@@ -152,6 +152,15 @@ BABY_NAMES = [
     "yana", "yara", "yoko", "yuri",
 
     "zane", "zara", "zelda", "zoe", "zora",
+    
+    # more
+    "aarav", "adil", "adit", "alix", "anil", "anouk", "arun", "avni",
+    "ayla", "bria", "bryn", "cian", "cody", "devi", "eira", "elio",
+    "enzo", "gaia", "hale", "iris", "isha", "ivor", "juno", "kai",
+    "kavi", "kaya", "leif", "levi", "lior", "lumi", "lyle", "mika",
+    "mona", "nash", "navi", "neve", "nico", "noa", "nuri", "orla",
+    "ravi", "remo", "rina", "rio", "roan", "romy", "skye", "tegan",
+    "zoya", "zuri",
 ]
 
 

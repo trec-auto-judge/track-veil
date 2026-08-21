@@ -21,6 +21,9 @@ class IssueType(str, Enum):
     PARSE_ERROR = "parse_error"
     UNKNOWN_FORMAT = "unknown_format"
     SKIPPED_RECORD = "skipped_record"
+    # An identifying field found outside the paths the schema-driven pass owns:
+    # the second-pass scan caught something the format's own handling missed.
+    IDENTIFIER_FOUND = "identifier_found"
 
 
 class EmailAction(str, Enum):
