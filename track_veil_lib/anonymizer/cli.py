@@ -1122,6 +1122,8 @@ def _parse_metadata_for_prio1(data_dir: Path, task_name: str) -> dict:
     Returns dict with:
         - prio1_runs: list of run_ids with std-priority "1 (top)" or "1 (highest)"
         - all_runs: list of all run_ids in metadata
+        - run_teams: {run_id: team}, so a run's team is known without a mapping DB
+          (ranking TSV files carry no team of their own)
         - files: list of matched file paths
     """
     import json
@@ -1129,6 +1131,7 @@ def _parse_metadata_for_prio1(data_dir: Path, task_name: str) -> dict:
     result = {
         "prio1_runs": [],
         "all_runs": [],
+        "run_teams": {},
         "files": [],
     }
 
@@ -1148,6 +1151,9 @@ def _parse_metadata_for_prio1(data_dir: Path, task_name: str) -> dict:
                         run_id = data.get("runtag") or data.get("run_id")
                         if run_id:
                             result["all_runs"].append(run_id)
+                            team = data.get("org") or data.get("team_id")
+                            if team:
+                                result["run_teams"][run_id] = team
                             # prio1 runs have std-priority == "1 (top)" or "1 (highest)"
                             prio = data.get("std-priority", data.get("std-prio", ""))
                             if prio in ("1", "1 (top)", "1 (highest)"):
@@ -1355,6 +1361,9 @@ def info_command(
     total_runs = 0
     total_topics: set[str] = set()
     total_teams: set[str] = set()
+    # Tasks whose team could not be determined: no mapping DB, and the files carry
+    # no team of their own (TSV rankings). Reported as "?" rather than 0.
+    uncounted_tasks: list[str] = []
     total_lines = 0
 
     # Per-task stats
@@ -1380,9 +1389,10 @@ def info_command(
             task_name = task_dir.name
             run_files = [f for f in task_dir.iterdir() if f.is_file()]
 
-            # Get prio1 runs from metadata
+            # Get prio1 runs and run->team from metadata
             metadata_data = _parse_metadata_for_prio1(data_dir, task_name)
             task_stats[task_name]["prio1_runs"] = metadata_data["prio1_runs"]
+            metadata_teams = metadata_data["run_teams"]
 
             for run_file in run_files:
                 task_stats[task_name]["run_files"] += 1
@@ -1392,12 +1402,8 @@ def info_command(
                 run_id = run_file.name
                 task_stats[task_name]["run_ids"].add(run_id)
 
-                # Look up team from mapping DB
-                # Try full filename first, then stem (without extension)
-                team = run_to_team.get(run_id) or run_to_team.get(run_file.stem)
-                if team:
-                    task_stats[task_name]["teams"].add(team)
-                    total_teams.add(team)
+                # Teams named by this file's own content, collected below
+                content_teams: set[str] = set()
 
                 # Detect format and extract stats
                 file_format = _detect_file_type(run_file)
@@ -1420,8 +1426,7 @@ def info_command(
                                         topic_id = str(data["metadata"].get("topic_id", ""))
                                         team_id = data["metadata"].get("team_id", "")
                                         if team_id:
-                                            task_stats[task_name]["teams"].add(team_id)
-                                            total_teams.add(team_id)
+                                            content_teams.add(team_id)
                                     if topic_id:
                                         task_stats[task_name]["topics"].add(topic_id)
                                         total_topics.add(topic_id)
@@ -1443,9 +1448,43 @@ def info_command(
                     except IOError:
                         pass
 
+                # One source per file, in order of authority - never unioned, because
+                # a team named in runs/ and again in metadata/ is deliberately given
+                # two different pseudonyms, and counting both reports one team as two.
+                #
+                #   1. the file's own content (Report JSONL: metadata.team_id)
+                #   2. metadata/{task}/*.jl, which maps runtag -> org. Ranking TSV
+                #      carries no team, and this is part of the dataset, so no
+                #      mapping DB is needed for it either.
+                #   3. the mapping DB, if one was passed
+                if content_teams:
+                    file_teams = content_teams
+                else:
+                    team = (metadata_teams.get(run_id)
+                            or metadata_teams.get(run_file.stem)
+                            or run_to_team.get(run_id)
+                            or run_to_team.get(run_file.stem))
+                    file_teams = {team} if team else set()
+
+                task_stats[task_name]["teams"].update(file_teams)
+                total_teams.update(file_teams)
+
+        # Without a mapping DB, teams can only be read out of JSONL content, so any
+        # task holding TSV rankings contributes none. Say so rather than reporting a
+        # confident total that silently omits those tasks.
+        # A task with run files but no team from any source - not "zero teams"
+        uncounted_tasks = sorted(
+            name for name, ts in task_stats.items()
+            if ts["run_files"] and not ts["teams"]
+        )
+
         # Print runs summary
         click.echo(f"  Total run files: {total_runs}")
-        if total_teams:
+        if uncounted_tasks:
+            click.echo(f"  Total teams: {len(total_teams)} so far - unknown for "
+                       f"{', '.join(uncounted_tasks)} (no team in those run files, "
+                       f"and none listed in metadata/)")
+        elif total_teams:
             click.echo(f"  Total teams: {len(total_teams)}")
         elif not run_to_team:
             click.echo(f"  Total teams: (needs mapping DB for TSV files)")
@@ -1454,13 +1493,19 @@ def info_command(
         click.echo(f"  Total topics: {len(total_topics)}")
         click.echo(f"  Total lines: {total_lines}")
 
-        if verbose:
+        # Per-task breakdown, always: the totals alone hide which task a team or run
+        # belongs to, and hide that a task's teams could not be counted at all.
+        if task_stats:
             click.echo()
             for task_name in sorted(task_stats.keys()):
                 ts = task_stats[task_name]
-                team_info = f", teams={len(ts['teams'])}"
-                click.echo(f"  [{task_name}] runs={ts['run_files']}{team_info}, "
-                          f"topics={len(ts['topics'])}, lines={ts['lines']}, format={ts['format']}")
+                # "?" not "0": no team in these files, which is not the same as none
+                teams = "?" if task_name in uncounted_tasks else len(ts["teams"])
+                line = f"  [{task_name}] runs={ts['run_files']}, teams={teams}"
+                if verbose:
+                    line += (f", topics={len(ts['topics'])}, lines={ts['lines']}, "
+                             f"format={ts['format']}")
+                click.echo(line)
         click.echo()
 
     # === EVAL DIRECTORY ===
@@ -1605,7 +1650,8 @@ def info_command(
             # or use data_dir name as track
             track = data_dir.name
 
-            teams = len(ts.get("teams", set()))
+            # "?" rather than 0 where the team could not be read from the files
+            teams = "?" if task_name in uncounted_tasks else len(ts.get("teams", set()))
             runs = ts.get("run_files", 0)
             prio1 = len(ts.get("prio1_runs", []))
             topics = len(ts.get("topics", set()))
