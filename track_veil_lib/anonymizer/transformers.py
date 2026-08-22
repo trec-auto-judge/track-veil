@@ -222,6 +222,7 @@ def scan_for_emails(
     task: str = "",
     parent: Any = None,
     parent_key: Any = None,
+    declared_fields: Tuple[str, ...] = (),
 ) -> bool:
     """Recursively find email addresses by value and apply the email policy.
 
@@ -230,16 +231,33 @@ def scan_for_emails(
     decides: REDACT rewrites in place, DROP_FIELD removes the field, IGNORE leaves
     it. The handler is where the answer is remembered per task and field.
 
+    ``declared_fields`` names keys that hold an address by declaration, complementing
+    the pattern: matching needs the value to LOOK like an address, so an obfuscated or
+    malformed one ("a.person AT uni DOT edu") slips past. Under a declared name no
+    pattern is needed, and REDACT takes the whole value rather than a matched span.
+
     Returns True if the field this was called on should be dropped by its parent.
     """
     if isinstance(obj, str):
-        for email in EMAIL_PATTERN.findall(obj):
+        declared = isinstance(parent_key, str) and any(
+            parent_key.lower() == name.lower() for name in declared_fields
+        )
+        # Under a declared name the value IS the address, whatever it looks like.
+        addresses = EMAIL_PATTERN.findall(obj) or ([obj] if declared else [])
+
+        for email in addresses:
             errors.add_email_warning(file_path, line_num, path, email)
 
             if email_handler and parent is not None:
                 action = email_handler(task, path, email, file_path)
                 if action == EmailAction.REDACT:
-                    parent[parent_key] = EMAIL_PATTERN.sub(REDACTED, parent[parent_key])
+                    # A declared field goes whole - the rest of its value is the
+                    # address's context, not text worth keeping. Elsewhere only the
+                    # address goes, so the surrounding sentence survives.
+                    parent[parent_key] = (
+                        REDACTED if declared
+                        else EMAIL_PATTERN.sub(REDACTED, parent[parent_key])
+                    )
                 elif action == EmailAction.DROP_FIELD:
                     return True
         return False
@@ -250,7 +268,7 @@ def scan_for_emails(
             if scan_for_emails(
                 value, f"{path}.{key}" if path else key, file_path, line_num,
                 errors=errors, email_handler=email_handler, task=task,
-                parent=obj, parent_key=key,
+                parent=obj, parent_key=key, declared_fields=declared_fields,
             ):
                 keys_to_drop.append(key)
         for key in keys_to_drop:
@@ -263,7 +281,7 @@ def scan_for_emails(
             if scan_for_emails(
                 item, f"{path}[{index}]", file_path, line_num,
                 errors=errors, email_handler=email_handler, task=task,
-                parent=obj, parent_key=index,
+                parent=obj, parent_key=index, declared_fields=declared_fields,
             ):
                 indices_to_drop.append(index)
         for index in reversed(indices_to_drop):
@@ -888,8 +906,61 @@ class RawJsonlTransformer:
         return count
 
 
+#: Metadata field names, by role.
+#:
+#: Tracks rename these slightly from one year to the next, so each role is a LIST of
+#: spellings: when a new track calls the team something else, add the name here rather
+#: than reworking the handling below. EVERY listed name a record carries is handled,
+#: not just the first - a record spelling the team two ways holds two identifying
+#: values, and leaving either behind publishes it.
+
+#: The team.
+ORG_FIELDS: Tuple[str, ...] = ("org",)
+
+#: The run.
+RUN_FIELDS: Tuple[str, ...] = ("runtag",)
+
+#: Free-text description fields are NOT listed here. They are redacted whole by the
+#: generic scan, via FIELDS_BY_CATEGORY[REDACT] in field_scan -- which is the single
+#: place to add another one. Substituting the team and run names into them instead was
+#: tried and dropped: it only removes the names we happen to know, and a description of
+#: a team's own system identifies it in ways no substitution reaches.
+
+#: Fields that hold an email address by declaration. Handed to ``scan_for_emails`` as
+#: its ``declared_fields``, so the two directions COMPLEMENT each other: the pattern
+#: finds an address under any name, and these names find an address the pattern would
+#: not match ("a.person AT uni DOT edu", a trailing typo).
+EMAIL_FIELDS: Tuple[str, ...] = ("email",)
+
+
+def present_string_fields(data: Dict[str, Any], names: Tuple[str, ...]) -> List[str]:
+    """Every one of ``names`` the record carries as a non-empty string.
+
+    A value of some other shape (a list where a team name was expected) is left out
+    deliberately: it is not something to anonymize by guessing, so it falls through to
+    the generic scan and, failing that, is reported by the second pass.
+    """
+    return [name for name in names if isinstance(data.get(name), str) and data[name]]
+
+
 class MetadataTransformer:
-    """Transform Metadata JSONL files (metadata/)."""
+    """Transform Metadata JSONL files (metadata/).
+
+    A metadata record is an open ``Dict[str, Any]``. Two roles are handled here by name
+    -- see ORG_FIELDS and RUN_FIELDS -- because each needs something only this
+    transformer can do:
+
+    - the team is the one place metadata and ``runs/`` can be cross-checked against
+      each other, and a disagreement means runs/ wins (see _resolve_team)
+    - the run warns when it has to mint a mapping for a run ``runs/`` never contained
+
+    Everything else goes through the same shared machinery as the Report and raw-JSONL
+    paths: ``anonymize_fields`` at any depth -- which is what redacts the free-text
+    description fields -- ``scan_for_emails`` by value (told which names hold an
+    address outright, see EMAIL_FIELDS), and a read-only second pass reporting whatever
+    neither of them resolved. There is no schema to enumerate here, so "everything
+    else" is literally every other key.
+    """
 
     def __init__(
         self,
@@ -899,7 +970,10 @@ class MetadataTransformer:
     ):
         self.mapping = mapping
         self.errors = errors
-        self.email_handler = email_handler
+        # Without a configured policy an address is redacted, which is what this
+        # transformer has always done: metadata files carry submitter addresses as a
+        # matter of course, so silence is not the safe default here.
+        self.email_handler = email_handler or (lambda *_args: EmailAction.REDACT)
         self._current_task: str = ""  # Set by caller before processing
         self._warned_runs: set = set()  # Track which runs we've warned about
         self._warned_team_mismatches: set = set()  # Track (org, task) pairs we've warned about
@@ -924,67 +998,150 @@ class MetadataTransformer:
             )
             return None
 
-        # Anonymize org (team) - check for mismatch with runs/ team
-        original_org = None
-        anon_org = None
-        if "org" in data and data["org"]:
-            original_org = data["org"]
-            runtag = data.get("runtag", "")
+        # The keys this record actually uses for each role. These are the keys handled
+        # by name below, and so the keys kept out of the generic scan: passing them
+        # there as well would anonymize each value twice (see field_scan, "anonymize
+        # each value exactly once").
+        org_fields = present_string_fields(data, ORG_FIELDS)
+        run_fields = present_string_fields(data, RUN_FIELDS)
+        handled: Tuple[str, ...] = tuple(org_fields + run_fields)
 
-            # Check if this run has a different team from runs/
-            if runtag:
-                expected_team = self.mapping.get_run_team(runtag)
-                if expected_team and expected_team != original_org:
-                    warn_key = (original_org, self._current_task)
-                    if warn_key not in self._warned_team_mismatches:
-                        self._warned_team_mismatches.add(warn_key)
-                        print(f"  [WARNING] Team mismatch for run '{runtag}': "
-                              f"metadata.org='{original_org}' vs runs.team_id='{expected_team}'")
+        # Read the run names before anonymizing anything: the mismatch check below
+        # looks them up in the mapping, which is keyed by the original.
+        original_runs: List[str] = [data[field] for field in run_fields]
 
+        # Anonymize org (team), with runs/ as the source of truth for the spelling.
+        orgs: List[Tuple[str, str]] = []
+        for field in org_fields:
+            original_org = self._resolve_team(field, data[field], original_runs)
             anon_org = self.mapping.get_or_create_team(original_org)
-            data["org"] = anon_org
+            data[field] = anon_org
+            orgs.append((original_org, anon_org))
 
         # Anonymize runtag (run_id)
-        # Warn if creating new mapping - run_id should normally come from runs/
-        original_run = None
-        anon_run = None
-        if "runtag" in data and data["runtag"]:
-            original_run = data["runtag"]
-            existing = self.mapping.get_run(original_run)
-            if existing is None and original_run not in self._warned_runs:
-                print(f"  [WARNING] Creating run mapping from metadata (not seen in runs/): {original_run}")
-                self._warned_runs.add(original_run)
+        runs: List[Tuple[str, str]] = []
+        for field, original_run in zip(run_fields, original_runs):
+            self._warn_on_unseen_run(original_run)
             anon_run = self.mapping.get_or_create_run(original_run)
-            data["runtag"] = anon_run
+            data[field] = anon_run
+            runs.append((original_run, anon_run))
 
         # Store run->team relationship for later lookups (e.g., info command)
-        if original_run and original_org:
-            self.mapping.store_run_team(original_run, original_org, anon_run, anon_org)
+        for original_run, anon_run in runs:
+            for original_org, anon_org in orgs:
+                self.mapping.store_run_team(original_run, original_org,
+                                            anon_run, anon_org)
 
-        # Check for email field
-        if "email" in data and data["email"]:
-            email = data["email"]
-            self.errors.add_email_warning(file_path, line_num, "email", email)
+        # Everything the handled keys do not cover, at any depth. This is where the
+        # free-text description fields get redacted, via FIELDS_BY_CATEGORY[REDACT].
+        cleaned = self._clean_generic_fields(data, handled)
 
-            # Check with handler for action
-            action = EmailAction.REDACT  # Default to redact
-            if self.email_handler:
-                action = self.email_handler(
-                    self._current_task, "email", email, file_path
-                )
+        # Addresses are found by VALUE, so one sitting in the description or in a
+        # nested field is caught too - not only a field literally named "email". The
+        # declared names catch the other direction: a value under one of them that no
+        # pattern would match.
+        scan_for_emails(
+            data, "", file_path, line_num,
+            errors=self.errors, email_handler=self.email_handler,
+            task=self._current_task, declared_fields=EMAIL_FIELDS,
+        )
 
-            if action == EmailAction.REDACT:
-                data["email"] = "[REDACTED]"
-            elif action == EmailAction.DROP_FIELD:
-                del data["email"]
-
-        if "std-desc" in data and data["std-desc"] and anon_run is not None and original_run is not None:
-            run_desc = data["std-desc"]
-            redacted_desc = re.sub(re.escape(original_run), anon_run, run_desc, flags=re.IGNORECASE) 
-            data["std-desc"] = redacted_desc
-
+        self._report_missed_fields(data, handled + cleaned, file_path, line_num)
 
         return json.dumps(data, separators=(",", ":"))
+
+    def _resolve_team(self, field: str, metadata_org: str, runtags: List[str]) -> str:
+        """The team that owns this record, with runs/ as the source of truth.
+
+        A metadata file may spell the team differently from the reports themselves
+        ("iastate" where runs/ said "isu"). Anonymizing both spellings mints two
+        pseudonyms and publishes one team as two, and leaves run_team_mappings
+        disagreeing with the team_id inside the reports -- so the spelling runs/
+        recorded for the same run wins, and the metadata one is replaced. This is the
+        rule resolve_run_identity already applies to run_id, where the filename wins
+        over the content.
+
+        Warns once per (metadata spelling, task). Returns the name to anonymize; the
+        metadata spelling is still substituted out of free text by the caller.
+        """
+        for runtag in runtags:
+            runs_team = self.mapping.get_run_team(runtag)
+            if not runs_team or runs_team == metadata_org:
+                continue
+
+            warn_key = (metadata_org, self._current_task)
+            if warn_key not in self._warned_team_mismatches:
+                self._warned_team_mismatches.add(warn_key)
+                print(f"  [WARNING] Team mismatch for run '{runtag}': "
+                      f"metadata.{field}='{metadata_org}' vs "
+                      f"runs.team_id='{runs_team}' - using runs.team_id")
+            return runs_team
+
+        # runs/ never recorded a team for these runs, so metadata is all there is.
+        return metadata_org
+
+    def _warn_on_unseen_run(self, original_run: str) -> None:
+        """Warn before minting a run mapping: run_id should normally come from runs/."""
+        if self.mapping.get_run(original_run) is None and original_run not in self._warned_runs:
+            print(f"  [WARNING] Creating run mapping from metadata (not seen in runs/): {original_run}")
+            self._warned_runs.add(original_run)
+
+    def _clean_generic_fields(
+        self,
+        data: Dict[str, Any],
+        handled: Tuple[str, ...],
+    ) -> Tuple[str, ...]:
+        """Deep-scan every key this transformer did not handle by name.
+
+        The scan runs over a *view* of the unhandled entries, so the handled ones are
+        not anonymized a second time. The view shares its dicts and lists with
+        ``data``, so nested edits land directly; top-level scalars the scan replaced,
+        and keys it dropped, are written back afterwards - surviving keys keep their
+        original position.
+
+        No ``expected_run_id``: the record's own runtag names THIS run, but a run_id
+        sitting in some other field may reference a different one (a baseline, a
+        parent run), which has to keep its own identity.
+
+        Returns the paths the scan acted on, so the second pass does not report them
+        back as gaps.
+        """
+        generic: Dict[str, Any] = {
+            key: value for key, value in data.items() if key not in handled
+        }
+        actions = anonymize_fields(generic, self.mapping)
+
+        for key in [k for k in data if k not in handled and k not in generic]:
+            del data[key]      # the scan dropped it outright (creator, evaldata)
+        data.update(generic)   # scalars it replaced; surviving keys keep their place
+
+        return tuple(action.path for action in actions)
+
+    def _report_missed_fields(
+        self,
+        data: Any,
+        handled: Tuple[str, ...],
+        file_path: Path,
+        line_num: int,
+    ) -> None:
+        """Identifying fields that neither pass above resolved.
+
+        The generic scan covers every path outside the handled keys, so a hit here
+        means it recognised the key and declined the value - a ``team_id`` holding a
+        list, say, which ``anonymize_fields`` skips as not-a-string. Reported rather
+        than repaired: rewriting a value of an unexpected shape is how data gets
+        corrupted.
+        """
+        for action in scan_for_missed_fields(data, handled):
+            self.errors.add_issue(
+                IssueType.IDENTIFIER_FOUND,
+                file_path,
+                line_num,
+                action.path,
+                f"Identifying field '{action.key}' ({action.category.value}) found at "
+                f"{action.path}, which the metadata handling did not anonymize",
+                original_value=action.original,
+            )
 
     def transform_file(
         self,

@@ -59,7 +59,10 @@ class FieldCategory(str, Enum):
 FIELDS_BY_CATEGORY: Dict[FieldCategory, Tuple[str, ...]] = {
     FieldCategory.TEAM: ("team_id", "team"),
     FieldCategory.RUN: ("run_id", "runid", "runtag"),
-    FieldCategory.REDACT: ("run_desc", "description", "std-desc"),
+    # Free text in which a team describes its own system. Redacted whole: a
+    # description identifies its author in ways no name substitution reaches.
+    # Metadata records carry a family of these; add each one here by name.
+    FieldCategory.REDACT: ("run_desc", "description", "std-desc", "rag-top-k"),
     # Email-bearing fields are deliberately NOT dropped here: addresses are found
     # by value (EMAIL_PATTERN) and handled through the email policy, which prompts
     # and remembers the answer. Dropping them by name would bypass that.

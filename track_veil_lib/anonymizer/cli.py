@@ -1,15 +1,45 @@
 """Command-line interface for track data anonymization."""
 
+import subprocess
+
 import click
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
+from .decisions import DecisionsStore
 from .mapping import MappingStore
 from .pipeline import AnonymizationPipeline, PipelineConfig
 
 
+#: The version `track-veil --version` reports, and the one recorded in the provenance
+#: of anything this CLI produces. One literal, so the two can never drift apart.
+VERSION = "0.4.5"
+
+
+def provenance() -> str:
+    """Version and commit of the code producing this output.
+
+    ``--dirty`` is deliberate: a run from a modified working tree cannot be reproduced
+    from the commit alone, so the output has to say so rather than name a commit that
+    is not what ran.
+
+    Falls back to the version alone instead of raising -- installed from a wheel there
+    is no checkout to ask, and recording provenance must never be the thing that breaks
+    a run.
+    """
+    repo = Path(__file__).resolve().parents[2]
+    try:
+        sha = subprocess.run(
+            ["git", "-C", str(repo), "describe", "--always", "--dirty", "--tags"],
+            capture_output=True, text=True, check=True, timeout=5,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return f"track-veil {VERSION} (commit unknown)"
+    return f"track-veil {VERSION} ({sha})"
+
+
 @click.group()
-@click.version_option(version="0.4.5")
+@click.version_option(version=VERSION)
 def cli():
     """Track Veil - Data Anonymization Tool.
 
@@ -1060,33 +1090,121 @@ def _detect_file_type(file_path: Path) -> str:
     return "unknown"
 
 
-def _parse_official_eval_jsonl(eval_path: Path, task_name: str) -> dict:
-    """Parse official eval JSONL files for a task and extract stats.
+#: Layouts a task's eval files may sit in, preferred first; {task} is the task name.
+#:
+#: The anonymizer writes eval/{task}/, mirroring metadata/{task}/, so that is the
+#: layout to expect. The flat form, with the task in the filename, is the older one and
+#: is still read so earlier exports keep working. Both are deliberately broad: finding
+#: an eval file says nothing about what produced it, which is the question below.
+EVAL_CANDIDATE_PATTERNS = (
+    "{task}/*.jsonl",
+    "*.{task}.*.jsonl",
+)
 
-    Looks for files matching: eval/*.{task_name}.official.eval.jsonl
+#: A filename containing this is *offered* as manually assessed when asking. Only a
+#: default for the prompt -- an official evaluation can perfectly well be computed by
+#: an automatic judge, so the name is a hint and never the answer.
+MANUAL_EVAL_HINT = "official"
+
+
+def _discover_eval_candidates(eval_path: Path, task_name: str) -> List[Path]:
+    """Every eval JSONL that could belong to `task_name`, across the known layouts."""
+    if not eval_path.exists():
+        return []
+
+    found: List[Path] = []
+    for pattern in EVAL_CANDIDATE_PATTERNS:
+        for path in sorted(eval_path.glob(pattern.format(task=task_name))):
+            if path.is_file() and path not in found:
+                found.append(path)
+    return found
+
+
+def _ask_manual_evals(eval_path: Path, task_name: str, candidates: List[Path]) -> List[Path]:
+    """Ask which of a task's eval files were produced from manual assessments."""
+    click.echo(f"\nWhich eval files for '{task_name}' come from MANUAL assessments?")
+    click.echo("  Only these count as assessed topics, and only these can serve as the")
+    click.echo("  meta-evaluation truth. An eval produced by an automatic judge does not,")
+    click.echo("  however official it is.")
+
+    chosen: List[Path] = []
+    for candidate in candidates:
+        default = MANUAL_EVAL_HINT in candidate.name.lower()
+        if click.confirm(f"  Is {candidate.relative_to(eval_path)} manually assessed?",
+                         default=default):
+            chosen.append(candidate)
+    return chosen
+
+
+def _resolve_manual_evals(
+    eval_path: Path,
+    task_name: str,
+    decisions: Optional[DecisionsStore] = None,
+    interactive: bool = False,
+) -> Tuple[List[Path], List[Path]]:
+    """Split a task's eval files into the manually assessed ones and the rest.
+
+    This cannot be read off a filename: "official" says who published an evaluation,
+    not what produced it, and an official eval computed by an automatic judge must not
+    become assessed_topics. So the question is put to the user and the answer is kept.
+
+    A stored answer replays. Non-interactively nothing is assumed and nothing is
+    recorded -- an assumption is not a decision, and recording one would replay it as
+    if it were.
+
+    Returns (manual, other); `other` is reported by the caller rather than dropped, so
+    "0 assessed topics" is never indistinguishable from "looked in the wrong place".
+    """
+    candidates = _discover_eval_candidates(eval_path, task_name)
+
+    stored = decisions.get_manual_evals(task_name) if decisions is not None else None
+    if stored is not None:
+        manual = [c for c in candidates if c.name in stored]
+    elif not candidates or not interactive:
+        manual = []
+    else:
+        manual = _ask_manual_evals(eval_path, task_name, candidates)
+        if decisions is not None:
+            decisions.set_manual_evals(task_name, [c.name for c in manual])
+
+    return manual, [c for c in candidates if c not in manual]
+
+
+def _parse_manual_eval_jsonl(
+    eval_path: Path,
+    task_name: str,
+    decisions: Optional[DecisionsStore] = None,
+    interactive: bool = False,
+) -> dict:
+    """Parse a task's manually assessed eval JSONL files and extract stats.
+
+    Which files those are is decided by _resolve_manual_evals, which asks when there is
+    no stored answer.
 
     Returns dict with:
         - topics: set of topic_ids (excluding "all" aggregates)
         - measures: set of measure names
         - runs: set of run_ids
         - lines: total line count
-        - files: list of matched file paths
+        - files: list of manually assessed file paths
+        - ignored: candidate files not produced from manual assessments
     """
     import json
+
+    official, ignored = _resolve_manual_evals(
+        eval_path, task_name, decisions, interactive
+    )
 
     result = {
         "topics": set(),
         "measures": set(),
         "runs": set(),
         "lines": 0,
-        "files": [],
+        "files": official,
+        "ignored": ignored,
     }
 
-    eval_pattern = f"*.{task_name}.official.eval.jsonl"
-    official_eval_files = list(eval_path.glob(eval_pattern)) if eval_path.exists() else []
-    result["files"] = official_eval_files
-
-    for eval_file in official_eval_files:
+    for eval_file in official:
         try:
             with open(eval_file, mode="rt", encoding="utf-8") as f:
                 for line in f:
@@ -1325,6 +1443,14 @@ def ensure_topics(
     is_flag=True,
     help="Output as GitHub-flavored markdown table",
 )
+@click.option(
+    "--load-decisions",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Load decisions from YAML file. Needed for the 'assessed topics' column: "
+         "which evals come from manual assessments is recorded there, and cannot be "
+         "told from a filename.",
+)
 def info_command(
     data_dir: Path,
     mapping_db: Optional[Path],
@@ -1332,6 +1458,7 @@ def info_command(
     eval_dir: str,
     verbose: bool,
     markdown: bool,
+    load_decisions: Optional[Path] = None,
 ):
     """Show statistics about an anonymized dataset.
 
@@ -1346,7 +1473,10 @@ def info_command(
     import json
     from collections import Counter, defaultdict
 
+    decisions = DecisionsStore.load(load_decisions) if load_decisions else None
+
     click.echo(f"Dataset: {data_dir.resolve()}")
+    click.echo(f"Generated by: {provenance()}")
 
     # Load mapping DB if provided (for run->team lookups)
     run_to_team: dict[str, str] = {}
@@ -1525,16 +1655,20 @@ def info_command(
     if eval_path.exists():
         click.echo(f"=== Eval ({eval_dir}/) ===")
 
-        # First, scan for official eval JSONL files at eval root: *.{task}.official.eval.jsonl
+        # The manually assessed evals: these are what the "assessed topics" column
+        # counts. Without a decisions file there is no way to know which they are, so
+        # nothing is assumed and the column reads 0 - see _resolve_manual_evals.
         for task_name in task_stats.keys():
-            official_data = _parse_official_eval_jsonl(eval_path, task_name)
-            if official_data["files"]:
-                eval_stats[task_name]["files"] += len(official_data["files"])
-                eval_files_total += len(official_data["files"])
-                eval_stats[task_name]["lines"] += official_data["lines"]
-                eval_stats[task_name]["topics"].update(official_data["topics"])
-                eval_stats[task_name]["measures"].update(official_data["measures"])
-                eval_stats[task_name]["runs"].update(official_data["runs"])
+            manual_data = _parse_manual_eval_jsonl(
+                eval_path, task_name, decisions=decisions, interactive=False
+            )
+            if manual_data["files"]:
+                eval_stats[task_name]["files"] += len(manual_data["files"])
+                eval_files_total += len(manual_data["files"])
+                eval_stats[task_name]["lines"] += manual_data["lines"]
+                eval_stats[task_name]["topics"].update(manual_data["topics"])
+                eval_stats[task_name]["measures"].update(manual_data["measures"])
+                eval_stats[task_name]["runs"].update(manual_data["runs"])
 
         # Also scan task subdirectories for other eval files (qrels, leaderboards, etc.)
         for task_dir in sorted(eval_path.iterdir()):
@@ -1701,12 +1835,33 @@ def info_command(
          "written to the yml relative to it, as the 'responses' path is. Without it, "
          "'topics' is left as a TODO for you to fill in.",
 )
+@click.option(
+    "--load-decisions",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Load decisions from YAML file (replays which eval files are official)",
+)
+@click.option(
+    "--save-decisions",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help="Save decisions to YAML file, so the next run does not ask again",
+)
+@click.option(
+    "--non-interactive",
+    is_flag=True,
+    help="Never ask. An eval file is official only if its name says so, or if a "
+         "loaded decision says so.",
+)
 def generate_datasets_yml(
     data_dir: Path,
     output_file: Optional[Path],
     runs_dir: str,
     eval_dir: str,
     topic_path: Optional[Path]=None,
+    load_decisions: Optional[Path]=None,
+    save_decisions: Optional[Path]=None,
+    non_interactive: bool=False,
 ):
     """Generate datasets.yml for use with run_all_datasets.py.
 
@@ -1723,6 +1878,8 @@ def generate_datasets_yml(
 
     if output_file is None:
         output_file = data_dir / "datasets.yml"
+
+    decisions = DecisionsStore.load(load_decisions) if load_decisions else DecisionsStore()
 
     datasets = []
 
@@ -1742,31 +1899,59 @@ def generate_datasets_yml(
         # Collect run IDs from filenames
         run_ids = sorted([f.name for f in task_dir.iterdir() if f.is_file()])
 
-        # Extract prio1_runs from metadata file
+        # Extract prio1_runs from metadata file.
+        #
+        # Only an EMPTY lookup is reported, here and below. The summary line at the end
+        # of the loop carries the counts, so naming a path that worked is noise; naming
+        # one that found nothing is not, because "0 prio1 runs" reads as a fact about
+        # the data until you know the metadata file was simply missing. That confusion
+        # is what hid the eval-directory bug.
         metadata_data = _parse_metadata_for_prio1(data_dir, task_name)
         prio1_runs = metadata_data["prio1_runs"]
-        click.echo(f"  [DEBUG] Looking for metadata at: {data_dir}/metadata/{task_name}/*.jl", err=True)
-        click.echo(f"  [DEBUG] Found metadata files: {[f.name for f in metadata_data['files']]}", err=True)
-        click.echo(f"  [DEBUG] Found {len(prio1_runs)} prio1 runs: {prio1_runs}", err=True)
+        if not metadata_data["files"]:
+            click.echo(f"  [no metadata] {data_dir}/metadata/{task_name}/*.jl", err=True)
 
-        # Extract assessed topics from official eval JSONL (if exists)
-        # Pattern: eval/*.{task}.official.eval.jsonl (at eval root, not in subdirs)
-        official_data = _parse_official_eval_jsonl(eval_path, task_name)
-        click.echo(f"  [DEBUG] Looking for eval at: {eval_path}/*.{task_name}.official.eval.jsonl", err=True)
-        click.echo(f"  [DEBUG] Found eval files: {[f.name for f in official_data['files']]}", err=True)
-        assessed_topics = sorted(official_data["topics"])
+        # A topic counts as assessed only where a MANUAL evaluation covers it, and no
+        # filename distinguishes a manual eval from an automatic one, so
+        # _resolve_manual_evals asks. 'truth' is decided separately, below.
+        manual_data = _parse_manual_eval_jsonl(
+            eval_path, task_name, decisions=decisions, interactive=not non_interactive
+        )
+        if not manual_data["files"] and not manual_data["ignored"]:
+            patterns = ", ".join(p.format(task=task_name) for p in EVAL_CANDIDATE_PATTERNS)
+            click.echo(f"  [no eval files] {eval_path} as {patterns}", err=True)
+        for ignored in manual_data["ignored"]:
+            click.echo(f"  [not manually assessed] {ignored.relative_to(eval_path)}", err=True)
+        assessed_topics = sorted(manual_data["topics"])
+
+        # 'truth' is the leaderboard a meta-evaluation correlates against, which is a
+        # different question from which evals are manual. A manually assessed eval is
+        # the better reference, so it wins; but where none has been identified the
+        # available eval is still what there is to correlate against, and leaving
+        # 'truth' unset would mean no meta-evaluation can run at all.
+        #
+        # It is a single path (run_all_datasets.Dataset.truth), so with several
+        # candidates there is no basis for choosing and it stays unset rather than
+        # guessed - a wrong truth file silently corrupts every correlation.
+        truth_files = manual_data["files"] or manual_data["ignored"]
+        truth = str(truth_files[0].relative_to(data_dir)) if len(truth_files) == 1 else None
+        if len(truth_files) > 1:
+            click.echo(f"  [truth unset] several eval files to choose from: "
+                       f"{[f.name for f in truth_files]}", err=True)
 
         topic_path_rel = topic_path.relative_to(data_dir) if topic_path else None
         dataset_entry = {
             "name": task_name,
             "responses": str(task_dir.relative_to(data_dir)),
-            "topics":  str(topic_path_rel) if topic_path_rel is not None else  "TODO: path to topics JSONL file", 
+            "topics":  str(topic_path_rel) if topic_path_rel is not None else  "TODO: path to topics JSONL file",
             "prio1_runs": prio1_runs,
             "assessed_topics": assessed_topics,
+            "truth": truth,
         }
         datasets.append(dataset_entry)
 
-        click.echo(f"  {task_name}: {len(run_ids)} runs, {len(prio1_runs)} prio1, {len(assessed_topics)} assessed topics")
+        click.echo(f"  {task_name}: {len(run_ids)} runs, {len(prio1_runs)} prio1, "
+                   f"{len(assessed_topics)} assessed topics, truth={truth or 'none'}")
 
     # Write YAML
     output_data = {"datasets": datasets}
@@ -1775,6 +1960,10 @@ def generate_datasets_yml(
         f.write("# Generated by track-veil generate-datasets-yml\n")
         # f.write("# TODO: Fill in 'topics' paths\n\n")
         yaml.dump(output_data, f, default_flow_style=False, sort_keys=False)
+
+    if save_decisions:
+        decisions.save(save_decisions)
+        click.echo(f"Saved decisions to {save_decisions}")
 
     click.echo(f"\nGenerated {output_file} with {len(datasets)} dataset(s)")
     click.echo("NOTE: You must manually fill in 'topics' paths")

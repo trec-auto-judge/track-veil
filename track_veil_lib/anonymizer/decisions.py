@@ -99,6 +99,12 @@ class DecisionsStore:
     # Email policies: task_name -> {field_path: action}
     email_policies: Dict[str, Dict[str, str]] = field(default_factory=dict)
 
+    # Which eval filenames were produced from MANUAL assessments: task -> [filename].
+    # Only these become assessed_topics and can serve as the meta-evaluation truth.
+    # No filename reveals it -- an official evaluation may well be computed by an
+    # automatic judge -- so this is asked rather than guessed.
+    manual_evals: Dict[str, List[str]] = field(default_factory=dict)
+
     def save(self, path: Path) -> None:
         """Save decisions to YAML file."""
         data = {
@@ -111,6 +117,7 @@ class DecisionsStore:
             },
             "manual_run_ids": self.manual_run_ids,
             "email_policies": self.email_policies,
+            "manual_evals": self.manual_evals,
         }
 
         # Remove empty sections
@@ -142,6 +149,7 @@ class DecisionsStore:
 
         store.manual_run_ids = data.get("manual_run_ids", {})
         store.email_policies = data.get("email_policies", {})
+        store.manual_evals = data.get("manual_evals", {})
 
         return store
 
@@ -244,6 +252,22 @@ class DecisionsStore:
         """Get the stored record type for a runs/ directory, if any."""
         decision = self.runs_formats.get(task_name)
         return decision.content_type if decision else None
+
+    def set_manual_evals(self, task_name: str, filenames: List[str]) -> None:
+        """Record which eval filenames hold the official evaluation for a task.
+
+        An empty list is a real answer -- "none of these are manually assessed" --
+        and is stored as one, so the question is not put again on the next run.
+        """
+        self.manual_evals[task_name] = list(filenames)
+
+    def get_manual_evals(self, task_name: str) -> Optional[List[str]]:
+        """Stored official eval filenames, or None if the task was never decided.
+
+        None and [] mean different things here: never asked, versus asked and answered
+        "none of them". Callers must not collapse the two.
+        """
+        return self.manual_evals.get(task_name)
 
     def set_manual_run_id(self, task_name: str, filename: str, run_id: str) -> None:
         """Record a manual run_id extraction."""
