@@ -19,3 +19,16 @@ combined.eval.txt
 *.nugget-grades.jsonl
 *.preferences.jsonl
 build/
+
+# --- anonymizer working files -------------------------------------------------
+
+# Mapping databases hold the DE-ANONYMIZATION KEYS: every pseudonym paired with the
+# real team and run name it stands for. Never commit one. Git keeps a committed file
+# recoverable long after it is deleted, so a single slip undoes the anonymization for
+# every dataset ever built from that mapping.
+*.db
+
+# Anonymized output, and the per-run state that produced it.
+data/anon/
+decisions.yml
+*-topic-list.txt
