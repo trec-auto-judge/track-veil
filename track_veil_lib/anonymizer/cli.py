@@ -1,6 +1,7 @@
 """Command-line interface for track data anonymization."""
 
 import subprocess
+from importlib.metadata import version as package_version
 
 import click
 from pathlib import Path
@@ -11,9 +12,14 @@ from .mapping import MappingStore
 from .pipeline import AnonymizationPipeline, PipelineConfig
 
 
-#: The version `track-veil --version` reports, and the one recorded in the provenance
-#: of anything this CLI produces. One literal, so the two can never drift apart.
-VERSION = "0.4.5"
+#: Distribution name, as declared in pyproject.toml. The version is read from the
+#: installed metadata rather than repeated here, so pyproject.toml is the only place a
+#: version number is written; a stale copy in the source is what let `--version` report
+#: 0.4.5 while the package built as 0.1.0.
+#:
+#: The lookup cannot fail in normal use: the `track-veil` console script exists only
+#: because the package is installed, so its dist-info is there whenever this runs.
+PACKAGE = "track_veil"
 
 
 def provenance() -> str:
@@ -34,12 +40,12 @@ def provenance() -> str:
             capture_output=True, text=True, check=True, timeout=5,
         ).stdout.strip()
     except (OSError, subprocess.SubprocessError):
-        return f"track-veil {VERSION} (commit unknown)"
-    return f"track-veil {VERSION} ({sha})"
+        return f"track-veil {package_version(PACKAGE)} (commit unknown)"
+    return f"track-veil {package_version(PACKAGE)} ({sha})"
 
 
 @click.group()
-@click.version_option(version=VERSION)
+@click.version_option(package_name=PACKAGE)
 def cli():
     """Track Veil - Data Anonymization Tool.
 
@@ -1836,6 +1842,14 @@ def info_command(
          "'topics' is left as a TODO for you to fill in.",
 )
 @click.option(
+    "--corpus",
+    default=None,
+    help="Document corpus reference to record in each dataset entry. Written verbatim: "
+         "a relative or absolute local path, an ir_datasets handle, a HuggingFace "
+         "reference (hf://datasets/trec-ragtime/ragtime2), or a URL. Omitted from the "
+         "yml when not given.",
+)
+@click.option(
     "--load-decisions",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     default=None,
@@ -1859,6 +1873,7 @@ def generate_datasets_yml(
     runs_dir: str,
     eval_dir: str,
     topic_path: Optional[Path]=None,
+    corpus: Optional[str]=None,
     load_decisions: Optional[Path]=None,
     save_decisions: Optional[Path]=None,
     non_interactive: bool=False,
@@ -1878,6 +1893,18 @@ def generate_datasets_yml(
 
     if output_file is None:
         output_file = data_dir / "datasets.yml"
+
+    # Drop any previous file BEFORE the work starts. The write below is the last step,
+    # so a run that stops early - EOF or Ctrl-C at a prompt, an exception mid-scan -
+    # would otherwise leave the last run's file sitting there looking current. That is
+    # how a stale `truth: null` outlived the change that would have filled it in.
+    #
+    # Unlinked rather than truncated: an empty YAML loads as zero datasets, which every
+    # consumer would accept in silence, whereas a missing file fails loudly. This does
+    # discard a good previous file when a run fails, which is the intent - regenerating
+    # is cheap, and trusting a stale one is not.
+    if output_file.exists():
+        output_file.unlink()
 
     decisions = DecisionsStore.load(load_decisions) if load_decisions else DecisionsStore()
 
@@ -1948,6 +1975,10 @@ def generate_datasets_yml(
             "assessed_topics": assessed_topics,
             "truth": truth,
         }
+        # Recorded verbatim, and only when given: unset must mean absent rather than a
+        # placeholder, since consumers pass this value straight through to --corpus.
+        if corpus:
+            dataset_entry["corpus"] = corpus
         datasets.append(dataset_entry)
 
         click.echo(f"  {task_name}: {len(run_ids)} runs, {len(prio1_runs)} prio1, "
