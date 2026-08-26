@@ -33,3 +33,8 @@ build/
 data/anon/
 decisions.yml
 *-topic-list.txt
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+.beads-credential-key
+.beads/
